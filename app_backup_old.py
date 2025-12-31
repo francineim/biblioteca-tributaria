@@ -3,9 +3,6 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 import base64
-import json
-import zipfile
-import io
 
 st.set_page_config(page_title="Biblioteca Tributária", page_icon="📚", layout="wide", initial_sidebar_state="expanded")
 DATA_DIR = Path("data")
@@ -18,7 +15,6 @@ st.markdown("""<style>
 .stat-number {font-size: 2.5rem; font-weight: bold;}
 .stat-label {font-size: 0.9rem; opacity: 0.9;}
 .tag {display: inline-block; background-color: #e3f2fd; color: #1565c0; padding: 0.2rem 0.6rem; border-radius: 15px; font-size: 0.8rem; margin-right: 0.3rem;}
-.backup-box {background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 1rem; margin: 1rem 0;}
 </style>""", unsafe_allow_html=True)
 
 def get_conn():
@@ -36,55 +32,6 @@ def init_db():
     conn.close()
 
 init_db()
-
-def criar_backup():
-    backup_data = io.BytesIO()
-    with zipfile.ZipFile(backup_data, 'w', zipfile.ZIP_DEFLATED) as zf:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT * FROM clientes")
-        clientes = [dict(row) for row in c.fetchall()]
-        c.execute("SELECT * FROM estudos")
-        estudos = [dict(row) for row in c.fetchall()]
-        c.execute("SELECT * FROM anexos")
-        anexos = [dict(row) for row in c.fetchall()]
-        conn.close()
-        backup_json = {"versao": "1.0", "data_backup": datetime.now().isoformat(), "clientes": clientes, "estudos": estudos, "anexos": anexos}
-        zf.writestr("backup_data.json", json.dumps(backup_json, ensure_ascii=False, indent=2))
-    backup_data.seek(0)
-    return backup_data
-
-def restaurar_backup(backup_file):
-    try:
-        content = backup_file.read()
-        backup_file.seek(0)
-        try:
-            with zipfile.ZipFile(io.BytesIO(content), 'r') as zf:
-                if "backup_data.json" in zf.namelist():
-                    backup = json.loads(zf.read("backup_data.json"))
-                else:
-                    return False, "ZIP inválido"
-        except zipfile.BadZipFile:
-            try:
-                backup = json.loads(content.decode('utf-8'))
-            except:
-                return False, "Arquivo inválido"
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("DELETE FROM anexos")
-        c.execute("DELETE FROM estudos")
-        c.execute("DELETE FROM clientes")
-        for cl in backup.get("clientes", []):
-            c.execute("INSERT INTO clientes (id, nome, cnpj, observacoes, created_at) VALUES (?, ?, ?, ?, ?)", (cl['id'], cl['nome'], cl.get('cnpj'), cl.get('observacoes'), cl.get('created_at')))
-        for est in backup.get("estudos", []):
-            c.execute("INSERT INTO estudos (id, cliente_id, titulo, resumo, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (est['id'], est['cliente_id'], est['titulo'], est['resumo'], est.get('tags'), est.get('created_at'), est.get('updated_at')))
-        for anx in backup.get("anexos", []):
-            c.execute("INSERT INTO anexos (id, estudo_id, filename, file_type, file_data, file_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (anx['id'], anx['estudo_id'], anx['filename'], anx['file_type'], anx['file_data'], anx.get('file_size'), anx.get('created_at')))
-        conn.commit()
-        conn.close()
-        return True, f"Restaurado: {len(backup.get('clientes', []))} clientes, {len(backup.get('estudos', []))} estudos, {len(backup.get('anexos', []))} anexos"
-    except Exception as e:
-        return False, f"Erro: {str(e)}"
 
 def criar_cliente(nome, cnpj=None, obs=None):
     conn = get_conn()
@@ -117,8 +64,6 @@ def obter_cliente(cid):
 def excluir_cliente(cid):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM anexos WHERE estudo_id IN (SELECT id FROM estudos WHERE cliente_id = ?)", (cid,))
-    c.execute("DELETE FROM estudos WHERE cliente_id = ?", (cid,))
     c.execute("DELETE FROM clientes WHERE id = ?", (cid,))
     conn.commit()
     conn.close()
@@ -158,7 +103,6 @@ def atualizar_estudo(eid, titulo, resumo, tags):
 def excluir_estudo(eid):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM anexos WHERE estudo_id = ?", (eid,))
     c.execute("DELETE FROM estudos WHERE id = ?", (eid,))
     conn.commit()
     conn.close()
@@ -256,7 +200,6 @@ with st.sidebar:
         if st.button("🏠 Início", use_container_width=True): go("home")
     with c2:
         if st.button("➕ Novo", use_container_width=True): go("novo")
-    if st.button("⚙️ Backup", use_container_width=True): go("config")
     st.markdown("---")
     busca = st.text_input("🔍 Buscar", placeholder="Cliente, estudo ou tag...")
     if busca:
@@ -323,7 +266,7 @@ elif st.session_state.pag == "novo":
                 tit = st.text_input("Título *")
                 res = st.text_area("Resumo da Operação *", height=250)
                 tags = st.text_input("Tags (separadas por vírgula)")
-                arqs = st.file_uploader("�� Anexos", accept_multiple_files=True, type=["pdf", "xls", "xlsx", "doc", "docx", "txt", "csv", "png", "jpg", "jpeg"])
+                arqs = st.file_uploader("📎 Anexos", accept_multiple_files=True, type=["pdf", "xls", "xlsx", "doc", "docx", "txt", "csv", "png", "jpg", "jpeg"])
                 if st.form_submit_button("💾 Salvar"):
                     if not tit or not res: st.error("Título e Resumo obrigatórios!")
                     else:
@@ -332,39 +275,6 @@ elif st.session_state.pag == "novo":
                             for a in arqs: add_anexo(eid, a.name, a.type or "application/octet-stream", a.read(), a.size)
                         st.success(f"✅ Estudo '{tit}' criado!")
                         st.balloons()
-
-elif st.session_state.pag == "config":
-    st.markdown("## ⚙️ Backup do Sistema")
-    st.markdown('<div class="backup-box">⚠️ <strong>Importante:</strong> Faça backup regularmente para não perder seus dados!</div>', unsafe_allow_html=True)
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("#### 📥 Criar Backup")
-        st.write("Gere um arquivo com todos os seus dados.")
-        if st.button("🔄 Gerar Backup", use_container_width=True):
-            backup_zip = criar_backup()
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.download_button("⬇️ Baixar Backup", backup_zip, f"backup_biblioteca_{ts}.zip", "application/zip", use_container_width=True)
-            st.success("✅ Backup gerado!")
-    with col2:
-        st.markdown("#### 📤 Restaurar Backup")
-        st.write("Envie um arquivo de backup para restaurar.")
-        up = st.file_uploader("Arquivo .zip ou .json", type=["zip", "json"])
-        if up:
-            st.warning("⚠️ Isso substituirá todos os dados atuais!")
-            if st.button("🔄 Restaurar", use_container_width=True, type="primary"):
-                ok, msg = restaurar_backup(up)
-                if ok:
-                    st.success(f"✅ {msg}")
-                    st.balloons()
-                else:
-                    st.error(f"❌ {msg}")
-    st.markdown("---")
-    st.markdown("### 📊 Estatísticas do Sistema")
-    s = stats()
-    c1, c2, c3 = st.columns(3)
-    with c1: st.metric("Clientes", s["clientes"])
-    with c2: st.metric("Estudos", s["estudos"])
-    with c3: st.metric("Anexos", s["anexos"])
 
 elif st.session_state.pag == "cliente":
     cl = obter_cliente(st.session_state.cli)
@@ -454,4 +364,4 @@ elif st.session_state.pag == "estudo":
             st.rerun()
 
 st.markdown("---")
-st.caption("📚 Biblioteca de Estudos Tributários | Sistema com Backup")
+st.caption("📚 Biblioteca de Estudos Tributários | Streamlit")
