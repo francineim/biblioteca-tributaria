@@ -1,12 +1,17 @@
 import streamlit as st
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import base64
 import json
 import zipfile
 import io
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from openai import OpenAI
+import requests
+import re
 
 st.set_page_config(page_title="Biblioteca Tributária", page_icon="📚", layout="wide", initial_sidebar_state="collapsed")
 DATA_DIR = Path("data")
@@ -19,39 +24,32 @@ try:
 except:
     client = None
 
+# Configurações de email
+try:
+    GMAIL_USER = st.secrets["GMAIL_USER"]
+    GMAIL_APP_PASSWORD = st.secrets["GMAIL_APP_PASSWORD"]
+    EMAIL_DESTINO = st.secrets["EMAIL_DESTINO"]
+except:
+    GMAIL_USER = None
+    GMAIL_APP_PASSWORD = None
+    EMAIL_DESTINO = None
+
 st.markdown("""<style>
-/* Geral */
 .main-header {font-size: 2.5rem; font-weight: bold; color: #1f4e79; margin-bottom: 0.5rem; text-align: center;}
 .sub-header {font-size: 1.1rem; color: #666; text-align: center; margin-bottom: 2rem;}
-
-/* Cards de estatísticas */
 .stat-card {background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 12px; padding: 1.5rem; color: white; text-align: center;}
 .stat-number {font-size: 2.5rem; font-weight: bold;}
 .stat-label {font-size: 0.9rem; opacity: 0.9;}
-
-/* Tags */
 .tag {display: inline-block; background-color: #e3f2fd; color: #1565c0; padding: 0.2rem 0.6rem; border-radius: 15px; font-size: 0.8rem; margin-right: 0.3rem; margin-bottom: 0.3rem;}
-
-/* Chat */
-.chat-container {max-width: 900px; margin: 0 auto; padding: 20px;}
 .user-message {background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px 20px; border-radius: 20px 20px 5px 20px; margin: 10px 0; margin-left: 15%;}
 .assistant-message {background-color: #f7f7f8; padding: 15px 20px; border-radius: 20px 20px 20px 5px; margin: 10px 0; margin-right: 15%; border: 1px solid #e5e5e5;}
 .fonte-card {background-color: #f0f9ff; border-left: 4px solid #0ea5e9; padding: 12px 15px; margin: 8px 0; border-radius: 0 8px 8px 0;}
 .fonte-card a {color: #0369a1; text-decoration: none; font-weight: 500;}
-.fonte-card a:hover {text-decoration: underline;}
 .biblioteca-card {background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 15px; margin: 8px 0; border-radius: 0 8px 8px 0;}
-
-/* Input de chat */
-.stTextArea textarea {font-size: 16px !important; border-radius: 15px !important;}
-
-/* Botões */
-.stButton button {border-radius: 10px !important;}
-
-/* Backup */
-.backup-box {background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 1rem; margin: 1rem 0;}
-
-/* Esconder menu hamburguer quando sidebar está collapsed */
-section[data-testid="stSidebar"][aria-expanded="false"] {display: none;}
+.atualizacao-card {background-color: #ecfdf5; border-left: 4px solid #10b981; padding: 15px; margin: 10px 0; border-radius: 0 10px 10px 0;}
+.atualizacao-card h4 {margin: 0 0 8px 0; color: #065f46;}
+.atualizacao-card p {margin: 5px 0; color: #374151; font-size: 0.95rem;}
+.atualizacao-header {background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; padding: 15px 20px; border-radius: 10px; margin-bottom: 15px;}
 </style>""", unsafe_allow_html=True)
 
 def get_conn():
@@ -66,386 +64,412 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS estudos (id INTEGER PRIMARY KEY AUTOINCREMENT, cliente_id INTEGER NOT NULL, titulo TEXT NOT NULL, resumo TEXT NOT NULL, tags TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE CASCADE)")
     c.execute("CREATE TABLE IF NOT EXISTS anexos (id INTEGER PRIMARY KEY AUTOINCREMENT, estudo_id INTEGER NOT NULL, filename TEXT NOT NULL, file_type TEXT NOT NULL, file_data TEXT NOT NULL, file_size INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (estudo_id) REFERENCES estudos(id) ON DELETE CASCADE)")
     c.execute("CREATE TABLE IF NOT EXISTS chat_historico (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, content TEXT NOT NULL, fontes TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    c.execute("CREATE TABLE IF NOT EXISTS atualizacoes_tributarias (id INTEGER PRIMARY KEY AUTOINCREMENT, fonte TEXT NOT NULL, titulo TEXT NOT NULL, resumo TEXT, link TEXT, data_publicacao DATE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     conn.commit()
     conn.close()
 
 init_db()
 
-# ==================== FONTES OFICIAIS ====================
+# ==================== BUSCA DE ATUALIZAÇÕES COM WEB SEARCH ====================
+
+def buscar_atualizacoes_web(fonte, data_inicio, data_fim):
+    """Busca atualizações usando GPT-4 com browsing capability"""
+    if not client:
+        return []
+    
+    # Mapear fontes para queries de busca específicas
+    queries_por_fonte = {
+        "Receita Federal": f"site:gov.br/receitafederal instrução normativa OR portaria OR solução consulta {data_inicio} {data_fim}",
+        "Planalto": f"site:planalto.gov.br lei OR decreto OR medida provisória tributário fiscal {data_inicio} {data_fim}",
+        "SEFAZ ES": f"site:sefaz.es.gov.br decreto OR portaria ICMS {data_inicio} {data_fim}",
+        "SEFAZ SC": f"site:sef.sc.gov.br decreto OR ato DIAT ICMS {data_inicio} {data_fim}",
+        "SEFAZ PR": f"site:fazenda.pr.gov.br decreto OR NPF ICMS {data_inicio} {data_fim}",
+        "SEFAZ MG": f"site:fazenda.mg.gov.br decreto OR portaria ICMS {data_inicio} {data_fim}",
+        "SEFAZ RJ": f"site:fazenda.rj.gov.br decreto OR resolução ICMS {data_inicio} {data_fim}",
+        "SEFAZ PE": f"site:sefaz.pe.gov.br decreto OR portaria ICMS {data_inicio} {data_fim}",
+        "SEFAZ CE": f"site:sefaz.ce.gov.br decreto OR instrução normativa ICMS {data_inicio} {data_fim}",
+        "CONFAZ": f"site:confaz.fazenda.gov.br convênio ICMS protocolo ajuste SINIEF {data_inicio} {data_fim}",
+        "Diário Oficial": f"site:in.gov.br tributário fiscal ICMS PIS COFINS {data_inicio} {data_fim}",
+    }
+    
+    query = queries_por_fonte.get(fonte, f"{fonte} legislação tributária {data_inicio} {data_fim}")
+    
+    prompt = f"""Você é um pesquisador especialista em legislação tributária brasileira.
+
+TAREFA: Pesquise e liste as atualizações tributárias REAIS publicadas pela fonte "{fonte}" no período de {data_inicio} a {data_fim}.
+
+IMPORTANTE:
+- Liste APENAS atos normativos REAIS e VERIFICÁVEIS
+- Inclua: número do ato, data de publicação, ementa/resumo
+- Foque em: Instruções Normativas, Decretos, Portarias, Convênios ICMS, Atos DIAT, Soluções de Consulta
+- Se não encontrar nada no período, retorne lista vazia
+
+Para cada atualização encontrada, forneça no formato JSON:
+{{
+    "atualizacoes": [
+        {{
+            "titulo": "Tipo e número do ato (ex: IN RFB nº 2.198/2024)",
+            "resumo": "Ementa ou resumo do conteúdo em 2-3 linhas",
+            "link": "URL oficial do documento",
+            "data": "YYYY-MM-DD"
+        }}
+    ]
+}}
+
+QUERY DE BUSCA: {query}
+
+Retorne APENAS o JSON válido, sem explicações."""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",  # Usando GPT-4o que tem melhor conhecimento atualizado
+            messages=[
+                {"role": "system", "content": "Você pesquisa legislação tributária brasileira. Retorne apenas JSON válido."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=3000,
+            temperature=0.2
+        )
+        
+        resposta = response.choices[0].message.content.strip()
+        
+        # Limpar JSON
+        if "```json" in resposta:
+            resposta = resposta.split("```json")[1].split("```")[0]
+        elif "```" in resposta:
+            resposta = resposta.split("```")[1].split("```")[0]
+        
+        dados = json.loads(resposta)
+        atualizacoes = dados.get("atualizacoes", [])
+        
+        # Adicionar fonte a cada atualização
+        for att in atualizacoes:
+            att["fonte"] = fonte
+        
+        return atualizacoes
+    
+    except Exception as e:
+        st.warning(f"Erro ao buscar {fonte}: {str(e)}")
+        return []
+
+def buscar_todas_atualizacoes(data_inicio, data_fim, fontes_selecionadas=None):
+    """Busca atualizações em todas as fontes"""
+    todas_fontes = [
+        "Receita Federal",
+        "Planalto", 
+        "SEFAZ ES",
+        "SEFAZ SC",
+        "SEFAZ PR",
+        "SEFAZ MG",
+        "SEFAZ RJ",
+        "SEFAZ PE",
+        "SEFAZ CE",
+        "CONFAZ",
+        "Diário Oficial"
+    ]
+    
+    if fontes_selecionadas:
+        fontes = fontes_selecionadas
+    else:
+        fontes = todas_fontes
+    
+    todas_atualizacoes = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, fonte in enumerate(fontes):
+        status_text.text(f"🔍 Buscando em {fonte}...")
+        progress_bar.progress((i + 1) / len(fontes))
+        
+        atualizacoes = buscar_atualizacoes_web(fonte, data_inicio, data_fim)
+        todas_atualizacoes.extend(atualizacoes)
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    return todas_atualizacoes
+
+def salvar_atualizacoes(atualizacoes):
+    """Salva atualizações no banco"""
+    conn = get_conn()
+    c = conn.cursor()
+    novos = 0
+    
+    for att in atualizacoes:
+        c.execute(
+            "SELECT id FROM atualizacoes_tributarias WHERE titulo = ? AND fonte = ?",
+            (att.get("titulo", ""), att.get("fonte", ""))
+        )
+        if not c.fetchone():
+            c.execute(
+                "INSERT INTO atualizacoes_tributarias (fonte, titulo, resumo, link, data_publicacao) VALUES (?, ?, ?, ?, ?)",
+                (att.get("fonte", ""), att.get("titulo", ""), att.get("resumo", ""), att.get("link", ""), att.get("data", ""))
+            )
+            novos += 1
+    
+    conn.commit()
+    conn.close()
+    return novos
+
+def obter_atualizacoes_db(dias=30):
+    """Obtém atualizações do banco"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM atualizacoes_tributarias ORDER BY data_publicacao DESC, created_at DESC LIMIT 100")
+    atualizacoes = [dict(row) for row in c.fetchall()]
+    conn.close()
+    return atualizacoes
+
+def limpar_atualizacoes():
+    """Limpa todas as atualizações"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM atualizacoes_tributarias")
+    conn.commit()
+    conn.close()
+
+def enviar_email_atualizacoes(atualizacoes, assunto_extra=""):
+    """Envia email com atualizações"""
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD or not EMAIL_DESTINO:
+        return False, "Credenciais de email não configuradas"
+    
+    if not atualizacoes:
+        return False, "Nenhuma atualização para enviar"
+    
+    html = f"""
+    <html>
+    <head><style>
+        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; }}
+        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; }}
+        .att {{ background: #f8f9fa; border-left: 4px solid #10b981; padding: 15px; margin: 15px 0; border-radius: 0 8px 8px 0; }}
+        .att h3 {{ color: #065f46; margin: 0 0 10px 0; }}
+        .att .fonte {{ color: #6b7280; font-size: 12px; text-transform: uppercase; }}
+        .att a {{ color: #0369a1; }}
+    </style></head>
+    <body>
+        <div class="header">
+            <h1>📚 Atualizações Tributárias</h1>
+            <p>{datetime.now().strftime("%d/%m/%Y %H:%M")}</p>
+        </div>
+        <p>Seguem as atualizações tributárias identificadas:</p>
+    """
+    
+    por_fonte = {}
+    for att in atualizacoes:
+        fonte = att.get("fonte", "Outros")
+        if fonte not in por_fonte:
+            por_fonte[fonte] = []
+        por_fonte[fonte].append(att)
+    
+    for fonte, lista in por_fonte.items():
+        html += f"<h2>🏛️ {fonte}</h2>"
+        for att in lista:
+            html += f"""
+            <div class="att">
+                <div class="fonte">{att.get('data_publicacao', att.get('data', ''))}</div>
+                <h3>{att.get('titulo', '')}</h3>
+                <p>{att.get('resumo', '')}</p>
+                <a href="{att.get('link', '#')}">🔗 Acessar documento</a>
+            </div>
+            """
+    
+    html += "</body></html>"
+    
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"📚 Atualizações Tributárias {assunto_extra} - {datetime.now().strftime('%d/%m/%Y')}"
+        msg['From'] = GMAIL_USER
+        msg['To'] = EMAIL_DESTINO
+        msg.attach(MIMEText(html, 'html'))
+        
+        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_USER, EMAIL_DESTINO, msg.as_string())
+        server.quit()
+        
+        return True, f"Email enviado para {EMAIL_DESTINO}"
+    except Exception as e:
+        return False, f"Erro: {str(e)}"
+
+# ==================== CONSULTOR IA ====================
 
 FONTES_OFICIAIS = {
-    "Receita Federal": {
-        "url": "https://www.gov.br/receitafederal",
-        "descricao": "Tributos federais, IRPJ, CSLL, PIS, COFINS, IPI"
-    },
-    "Planalto - Legislação": {
-        "url": "https://www.planalto.gov.br/ccivil_03/leis/",
-        "descricao": "Leis federais, Código Tributário Nacional"
-    },
-    "Portal da Reforma Tributária": {
-        "url": "https://www.gov.br/fazenda/pt-br/acesso-a-informacao/acoes-e-programas/reforma-tributaria",
-        "descricao": "Informações oficiais sobre a Reforma Tributária"
-    },
-    "SEFAZ SC": {
-        "url": "https://www.sef.sc.gov.br",
-        "descricao": "ICMS Santa Catarina, TTD, benefícios fiscais"
-    },
-    "SEFAZ ES": {
-        "url": "https://www.sefaz.es.gov.br",
-        "descricao": "ICMS Espírito Santo, INVEST-ES"
-    },
-    "SEFAZ MG": {
-        "url": "https://www.fazenda.mg.gov.br",
-        "descricao": "ICMS Minas Gerais, RICMS/MG"
-    },
-    "SEFAZ SP": {
-        "url": "https://portal.fazenda.sp.gov.br",
-        "descricao": "ICMS São Paulo, RICMS/SP, ST"
-    },
-    "SEFAZ RJ": {
-        "url": "https://www.fazenda.rj.gov.br",
-        "descricao": "ICMS Rio de Janeiro"
-    },
-    "SEFAZ PE": {
-        "url": "https://www.sefaz.pe.gov.br",
-        "descricao": "ICMS Pernambuco"
-    },
-    "SEFAZ CE": {
-        "url": "https://www.sefaz.ce.gov.br",
-        "descricao": "ICMS Ceará"
-    },
-    "CONFAZ": {
-        "url": "https://www.confaz.fazenda.gov.br",
-        "descricao": "Convênios ICMS, protocolos, ajustes SINIEF"
-    },
-    "STF - Supremo Tribunal Federal": {
-        "url": "https://portal.stf.jus.br",
-        "descricao": "Jurisprudência tributária, ADIs"
-    },
-    "STJ - Superior Tribunal de Justiça": {
-        "url": "https://www.stj.jus.br",
-        "descricao": "Jurisprudência tributária, REsp"
-    },
+    "Receita Federal": {"url": "https://www.gov.br/receitafederal", "descricao": "Tributos federais"},
+    "Planalto": {"url": "https://www.planalto.gov.br", "descricao": "Legislação federal"},
+    "SEFAZ ES": {"url": "https://www.sefaz.es.gov.br", "descricao": "ICMS Espírito Santo"},
+    "SEFAZ SC": {"url": "https://www.sef.sc.gov.br", "descricao": "ICMS Santa Catarina"},
+    "SEFAZ PR": {"url": "https://www.fazenda.pr.gov.br", "descricao": "ICMS Paraná"},
+    "SEFAZ MG": {"url": "https://www.fazenda.mg.gov.br", "descricao": "ICMS Minas Gerais"},
+    "SEFAZ SP": {"url": "https://portal.fazenda.sp.gov.br", "descricao": "ICMS São Paulo"},
+    "SEFAZ RJ": {"url": "https://www.fazenda.rj.gov.br", "descricao": "ICMS Rio de Janeiro"},
+    "CONFAZ": {"url": "https://www.confaz.fazenda.gov.br", "descricao": "Convênios ICMS"},
 }
 
 def buscar_na_biblioteca(pergunta):
-    """Busca estudos relacionados na biblioteca local"""
     conn = get_conn()
     c = conn.cursor()
-    
-    # Extrair palavras-chave
-    palavras = [p.strip().lower() for p in pergunta.split() if len(p) > 3]
-    
-    resultados = []
-    ids_vistos = set()
-    
-    for palavra in palavras:
-        c.execute("""
-            SELECT e.id, e.titulo, e.resumo, e.tags, c.nome as cliente_nome 
-            FROM estudos e 
-            JOIN clientes c ON e.cliente_id = c.id 
-            WHERE LOWER(e.titulo) LIKE ? OR LOWER(e.resumo) LIKE ? OR LOWER(e.tags) LIKE ?
-            ORDER BY e.created_at DESC LIMIT 5
-        """, (f"%{palavra}%", f"%{palavra}%", f"%{palavra}%"))
-        
+    palavras = [p.lower() for p in pergunta.split() if len(p) > 3]
+    resultados, ids = [], set()
+    for p in palavras:
+        c.execute("SELECT e.id, e.titulo, e.resumo, e.tags, c.nome as cliente_nome FROM estudos e JOIN clientes c ON e.cliente_id = c.id WHERE LOWER(e.titulo) LIKE ? OR LOWER(e.resumo) LIKE ? OR LOWER(e.tags) LIKE ? LIMIT 5", (f"%{p}%", f"%{p}%", f"%{p}%"))
         for row in c.fetchall():
-            if row['id'] not in ids_vistos:
+            if row['id'] not in ids:
                 resultados.append(dict(row))
-                ids_vistos.add(row['id'])
-    
+                ids.add(row['id'])
     conn.close()
     return resultados[:5]
 
-def identificar_fontes_relevantes(pergunta):
-    """Identifica fontes oficiais relevantes para a pergunta"""
-    pergunta_lower = pergunta.lower()
+def identificar_fontes(pergunta):
+    p = pergunta.lower()
     fontes = []
-    
-    # Palavras-chave para cada fonte
-    mapeamento = {
-        "reforma tributária": ["Portal da Reforma Tributária", "Receita Federal", "Planalto - Legislação"],
-        "reforma": ["Portal da Reforma Tributária", "Receita Federal"],
-        "ibs": ["Portal da Reforma Tributária", "CONFAZ"],
-        "cbs": ["Portal da Reforma Tributária", "Receita Federal"],
-        "split payment": ["Portal da Reforma Tributária"],
-        "icms": ["CONFAZ"],
-        "icms sc": ["SEFAZ SC", "CONFAZ"],
-        "icms es": ["SEFAZ ES", "CONFAZ"],
-        "icms mg": ["SEFAZ MG", "CONFAZ"],
-        "icms sp": ["SEFAZ SP", "CONFAZ"],
-        "icms rj": ["SEFAZ RJ", "CONFAZ"],
-        "icms pe": ["SEFAZ PE", "CONFAZ"],
-        "icms ce": ["SEFAZ CE", "CONFAZ"],
-        "santa catarina": ["SEFAZ SC"],
-        "espírito santo": ["SEFAZ ES"],
-        "espirito santo": ["SEFAZ ES"],
-        "minas gerais": ["SEFAZ MG"],
-        "são paulo": ["SEFAZ SP"],
-        "sao paulo": ["SEFAZ SP"],
-        "rio de janeiro": ["SEFAZ RJ"],
-        "pernambuco": ["SEFAZ PE"],
-        "ceará": ["SEFAZ CE"],
-        "ceara": ["SEFAZ CE"],
-        "pis": ["Receita Federal"],
-        "cofins": ["Receita Federal"],
-        "irpj": ["Receita Federal"],
-        "csll": ["Receita Federal"],
-        "ipi": ["Receita Federal"],
-        "federal": ["Receita Federal", "Planalto - Legislação"],
-        "lei": ["Planalto - Legislação"],
-        "decreto": ["Planalto - Legislação"],
-        "convênio": ["CONFAZ"],
-        "protocolo": ["CONFAZ"],
-        "substituição tributária": ["CONFAZ", "SEFAZ SP"],
-        "st": ["CONFAZ"],
-        "difal": ["CONFAZ"],
-        "stf": ["STF - Supremo Tribunal Federal"],
-        "supremo": ["STF - Supremo Tribunal Federal"],
-        "stj": ["STJ - Superior Tribunal de Justiça"],
-        "jurisprudência": ["STF - Supremo Tribunal Federal", "STJ - Superior Tribunal de Justiça"],
+    mapa = {
+        "receita federal": "Receita Federal", "pis": "Receita Federal", "cofins": "Receita Federal", "irpj": "Receita Federal",
+        "planalto": "Planalto", "lei": "Planalto", "decreto federal": "Planalto",
+        "espírito santo": "SEFAZ ES", "espirito santo": "SEFAZ ES", " es ": "SEFAZ ES",
+        "santa catarina": "SEFAZ SC", " sc ": "SEFAZ SC",
+        "paraná": "SEFAZ PR", "parana": "SEFAZ PR", " pr ": "SEFAZ PR",
+        "minas gerais": "SEFAZ MG", " mg ": "SEFAZ MG",
+        "são paulo": "SEFAZ SP", "sao paulo": "SEFAZ SP", " sp ": "SEFAZ SP",
+        "rio de janeiro": "SEFAZ RJ", " rj ": "SEFAZ RJ",
+        "convênio": "CONFAZ", "confaz": "CONFAZ", "icms": "CONFAZ",
     }
-    
-    fontes_adicionadas = set()
-    
-    for termo, lista_fontes in mapeamento.items():
-        if termo in pergunta_lower:
-            for fonte in lista_fontes:
-                if fonte not in fontes_adicionadas:
-                    fontes.append({
-                        "nome": fonte,
-                        "url": FONTES_OFICIAIS[fonte]["url"],
-                        "descricao": FONTES_OFICIAIS[fonte]["descricao"]
-                    })
-                    fontes_adicionadas.add(fonte)
-    
-    # Sempre adicionar Receita Federal e Planalto para questões tributárias
+    for termo, fonte in mapa.items():
+        if termo in p and fonte not in fontes:
+            fontes.append(fonte)
     if not fontes:
-        fontes.append({
-            "nome": "Receita Federal",
-            "url": FONTES_OFICIAIS["Receita Federal"]["url"],
-            "descricao": FONTES_OFICIAIS["Receita Federal"]["descricao"]
-        })
-        fontes.append({
-            "nome": "Planalto - Legislação",
-            "url": FONTES_OFICIAIS["Planalto - Legislação"]["url"],
-            "descricao": FONTES_OFICIAIS["Planalto - Legislação"]["descricao"]
-        })
-    
-    return fontes[:6]
+        fontes = ["Receita Federal", "Planalto"]
+    return [{"nome": f, "url": FONTES_OFICIAIS[f]["url"], "descricao": FONTES_OFICIAIS[f]["descricao"]} for f in fontes[:5]]
 
-def obter_contexto_biblioteca():
-    """Obtém resumo da biblioteca para contexto"""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT e.titulo, e.resumo, e.tags, c.nome as cliente_nome 
-        FROM estudos e 
-        JOIN clientes c ON e.cliente_id = c.id 
-        ORDER BY e.created_at DESC LIMIT 15
-    """)
-    estudos = c.fetchall()
-    conn.close()
+def consultar_agente(pergunta, historico):
+    if not client:
+        return "❌ API não configurada", [], []
     
-    if not estudos:
-        return "Biblioteca vazia - nenhum estudo cadastrado ainda."
+    materiais = buscar_na_biblioteca(pergunta)
+    fontes = identificar_fontes(pergunta)
     
     contexto = ""
-    for est in estudos:
-        contexto += f"• {est['titulo']} (Cliente: {est['cliente_nome']}, Tags: {est['tags'] or 'sem tags'})\n"
-    
-    return contexto
-
-def consultar_agente(pergunta, historico_mensagens):
-    """Consulta o agente de IA"""
-    if not client:
-        return "❌ API Key da OpenAI não configurada. Vá em Configurações para verificar.", [], []
-    
-    # Buscar na biblioteca
-    materiais = buscar_na_biblioteca(pergunta)
-    
-    # Identificar fontes relevantes
-    fontes = identificar_fontes_relevantes(pergunta)
-    
-    # Contexto da biblioteca
-    contexto_biblioteca = obter_contexto_biblioteca()
-    
-    # Montar contexto dos materiais encontrados
-    contexto_materiais = ""
     if materiais:
-        contexto_materiais = "\n\nMATERIAIS ENCONTRADOS NA BIBLIOTECA DO USUÁRIO:\n"
-        for m in materiais:
-            contexto_materiais += f"\n📄 **{m['titulo']}** (Cliente: {m['cliente_nome']})\n"
-            contexto_materiais += f"   Resumo: {m['resumo'][:300]}...\n"
+        contexto = "\nMATERIAIS DA BIBLIOTECA:\n" + "\n".join([f"- {m['titulo']}: {m['resumo'][:200]}" for m in materiais])
     
-    system_prompt = f"""Você é um assistente especialista em tributação brasileira, similar ao ChatGPT, integrado a uma biblioteca de estudos tributários.
-
-BIBLIOTECA DO USUÁRIO (estudos cadastrados):
-{contexto_biblioteca}
-{contexto_materiais}
-
-SUAS CAPACIDADES:
-1. Responder perguntas sobre tributação brasileira (ICMS, PIS, COFINS, IRPJ, CSLL, IPI, ISS, etc.)
-2. Explicar a Reforma Tributária (EC 132/2023, IBS, CBS, IS)
-3. Consultar e recomendar estudos da biblioteca do usuário
-4. Indicar fontes oficiais para consulta atualizada
-5. Explicar legislação, jurisprudência e procedimentos fiscais
-
-INSTRUÇÕES DE RESPOSTA:
-- Seja claro, objetivo e didático
-- Use linguagem profissional mas acessível
-- Estruture a resposta com tópicos quando apropriado
-- Se houver materiais relevantes na biblioteca, mencione-os naturalmente
-- Sempre indique que o usuário deve verificar a legislação vigente
-- Cite leis, decretos e normas quando relevante
-- Use markdown para formatar (negrito, listas, etc.)
-
-IMPORTANTE: 
-- Você tem conhecimento até sua data de corte, mas a legislação tributária muda frequentemente
-- Sempre recomende consultar as fontes oficiais para informações atualizadas
-- Se não souber algo com certeza, seja honesto e indique onde buscar"""
-
     try:
-        # Preparar mensagens
-        messages = [{"role": "system", "content": system_prompt}]
+        messages = [
+            {"role": "system", "content": f"Você é especialista em tributação brasileira. Seja claro e cite legislação.{contexto}"},
+            *[{"role": m["role"], "content": m["content"]} for m in historico[-10:]],
+            {"role": "user", "content": pergunta}
+        ]
         
-        # Adicionar histórico (últimas 10 mensagens)
-        for msg in historico_mensagens[-10:]:
-            messages.append({"role": msg["role"], "content": msg["content"]})
-        
-        # Adicionar pergunta atual
-        messages.append({"role": "user", "content": pergunta})
-        
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=2500,
-            temperature=0.4
-        )
-        
-        resposta = response.choices[0].message.content
-        return resposta, materiais, fontes
-    
+        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=2500, temperature=0.4)
+        return response.choices[0].message.content, materiais, fontes
     except Exception as e:
-        return f"❌ Erro ao consultar: {str(e)}", [], []
+        return f"❌ Erro: {str(e)}", [], []
 
-def salvar_mensagem(role, content, fontes=None):
-    """Salva mensagem no histórico"""
+def salvar_msg(role, content, fontes=None):
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO chat_historico (role, content, fontes) VALUES (?, ?, ?)",
-        (role, content, json.dumps(fontes) if fontes else None)
-    )
+    c.execute("INSERT INTO chat_historico (role, content, fontes) VALUES (?, ?, ?)", (role, content, json.dumps(fontes) if fontes else None))
     conn.commit()
     conn.close()
 
 def obter_historico():
-    """Obtém histórico de mensagens"""
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT role, content, fontes, created_at FROM chat_historico ORDER BY created_at ASC")
-    historico = [{"role": r["role"], "content": r["content"], "fontes": r["fontes"], "created_at": r["created_at"]} for r in c.fetchall()]
+    h = [{"role": r["role"], "content": r["content"], "fontes": r["fontes"], "created_at": r["created_at"]} for r in c.fetchall()]
     conn.close()
-    return historico
+    return h
 
-def limpar_historico():
-    """Limpa histórico"""
+def limpar_chat():
     conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM chat_historico")
     conn.commit()
     conn.close()
 
-# ==================== FUNÇÕES CRUD (mantidas) ====================
+# ==================== CRUD ====================
 
 def criar_backup():
-    backup_data = io.BytesIO()
-    with zipfile.ZipFile(backup_data, 'w', zipfile.ZIP_DEFLATED) as zf:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         conn = get_conn()
         c = conn.cursor()
-        c.execute("SELECT * FROM clientes")
-        clientes = [dict(row) for row in c.fetchall()]
-        c.execute("SELECT * FROM estudos")
-        estudos = [dict(row) for row in c.fetchall()]
-        c.execute("SELECT * FROM anexos")
-        anexos = [dict(row) for row in c.fetchall()]
-        c.execute("SELECT * FROM chat_historico")
-        historico = [dict(row) for row in c.fetchall()]
+        data = {}
+        for tabela in ["clientes", "estudos", "anexos", "chat_historico", "atualizacoes_tributarias"]:
+            c.execute(f"SELECT * FROM {tabela}")
+            data[tabela] = [dict(row) for row in c.fetchall()]
         conn.close()
-        backup_json = {"versao": "2.0", "data_backup": datetime.now().isoformat(), "clientes": clientes, "estudos": estudos, "anexos": anexos, "chat_historico": historico}
-        zf.writestr("backup_data.json", json.dumps(backup_json, ensure_ascii=False, indent=2))
-    backup_data.seek(0)
-    return backup_data
+        data["versao"] = "3.0"
+        data["data_backup"] = datetime.now().isoformat()
+        zf.writestr("backup.json", json.dumps(data, ensure_ascii=False, indent=2))
+    buf.seek(0)
+    return buf
 
-def restaurar_backup(backup_file):
+def restaurar_backup(file):
     try:
-        content = backup_file.read()
-        backup_file.seek(0)
+        content = file.read()
         try:
             with zipfile.ZipFile(io.BytesIO(content), 'r') as zf:
-                if "backup_data.json" in zf.namelist():
-                    backup = json.loads(zf.read("backup_data.json"))
-                else:
-                    return False, "ZIP inválido"
-        except zipfile.BadZipFile:
-            try:
-                backup = json.loads(content.decode('utf-8'))
-            except:
-                return False, "Arquivo inválido"
+                data = json.loads(zf.read("backup.json"))
+        except:
+            data = json.loads(content.decode('utf-8'))
+        
         conn = get_conn()
         c = conn.cursor()
-        c.execute("DELETE FROM anexos")
-        c.execute("DELETE FROM estudos")
-        c.execute("DELETE FROM clientes")
-        c.execute("DELETE FROM chat_historico")
-        for cl in backup.get("clientes", []):
-            c.execute("INSERT INTO clientes (id, nome, cnpj, observacoes, created_at) VALUES (?, ?, ?, ?, ?)", (cl['id'], cl['nome'], cl.get('cnpj'), cl.get('observacoes'), cl.get('created_at')))
-        for est in backup.get("estudos", []):
-            c.execute("INSERT INTO estudos (id, cliente_id, titulo, resumo, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (est['id'], est['cliente_id'], est['titulo'], est['resumo'], est.get('tags'), est.get('created_at'), est.get('updated_at')))
-        for anx in backup.get("anexos", []):
-            c.execute("INSERT INTO anexos (id, estudo_id, filename, file_type, file_data, file_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (anx['id'], anx['estudo_id'], anx['filename'], anx['file_type'], anx['file_data'], anx.get('file_size'), anx.get('created_at')))
-        for chat in backup.get("chat_historico", []):
-            c.execute("INSERT INTO chat_historico (id, role, content, fontes, created_at) VALUES (?, ?, ?, ?, ?)", (chat['id'], chat['role'], chat['content'], chat.get('fontes'), chat.get('created_at')))
+        for t in ["anexos", "estudos", "clientes", "chat_historico", "atualizacoes_tributarias"]:
+            c.execute(f"DELETE FROM {t}")
+        
+        for cl in data.get("clientes", []):
+            c.execute("INSERT INTO clientes (id, nome, cnpj, observacoes, created_at) VALUES (?, ?, ?, ?, ?)", 
+                     (cl['id'], cl['nome'], cl.get('cnpj'), cl.get('observacoes'), cl.get('created_at')))
+        for e in data.get("estudos", []):
+            c.execute("INSERT INTO estudos (id, cliente_id, titulo, resumo, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (e['id'], e['cliente_id'], e['titulo'], e['resumo'], e.get('tags'), e.get('created_at'), e.get('updated_at')))
+        for a in data.get("anexos", []):
+            c.execute("INSERT INTO anexos (id, estudo_id, filename, file_type, file_data, file_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (a['id'], a['estudo_id'], a['filename'], a['file_type'], a['file_data'], a.get('file_size'), a.get('created_at')))
+        for ch in data.get("chat_historico", []):
+            c.execute("INSERT INTO chat_historico (id, role, content, fontes, created_at) VALUES (?, ?, ?, ?, ?)",
+                     (ch['id'], ch['role'], ch['content'], ch.get('fontes'), ch.get('created_at')))
+        for at in data.get("atualizacoes_tributarias", []):
+            c.execute("INSERT INTO atualizacoes_tributarias (id, fonte, titulo, resumo, link, data_publicacao, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (at['id'], at['fonte'], at['titulo'], at.get('resumo'), at.get('link'), at.get('data_publicacao'), at.get('created_at')))
         conn.commit()
         conn.close()
-        return True, f"Restaurado com sucesso!"
+        return True, "Restaurado!"
     except Exception as e:
-        return False, f"Erro: {str(e)}"
+        return False, str(e)
 
 def criar_cliente(nome, cnpj=None, obs=None):
     conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT INTO clientes (nome, cnpj, observacoes) VALUES (?, ?, ?)", (nome, cnpj, obs))
     conn.commit()
-    cid = c.lastrowid
+    id = c.lastrowid
     conn.close()
-    return cid
+    return id
 
-def listar_clientes(busca=None):
+def listar_clientes():
     conn = get_conn()
     c = conn.cursor()
-    if busca:
-        c.execute("SELECT * FROM clientes WHERE nome LIKE ? OR cnpj LIKE ? ORDER BY nome", (f"%{busca}%", f"%{busca}%"))
-    else:
-        c.execute("SELECT * FROM clientes ORDER BY nome")
+    c.execute("SELECT * FROM clientes ORDER BY nome")
     r = c.fetchall()
     conn.close()
     return r
 
-def obter_cliente(cid):
+def obter_cliente(id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT * FROM clientes WHERE id = ?", (cid,))
+    c.execute("SELECT * FROM clientes WHERE id = ?", (id,))
     r = c.fetchone()
     conn.close()
     return r
 
-def excluir_cliente(cid):
+def excluir_cliente(id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM anexos WHERE estudo_id IN (SELECT id FROM estudos WHERE cliente_id = ?)", (cid,))
-    c.execute("DELETE FROM estudos WHERE cliente_id = ?", (cid,))
-    c.execute("DELETE FROM clientes WHERE id = ?", (cid,))
+    c.execute("DELETE FROM anexos WHERE estudo_id IN (SELECT id FROM estudos WHERE cliente_id = ?)", (id,))
+    c.execute("DELETE FROM estudos WHERE cliente_id = ?", (id,))
+    c.execute("DELETE FROM clientes WHERE id = ?", (id,))
     conn.commit()
     conn.close()
 
@@ -454,9 +478,9 @@ def criar_estudo(cid, titulo, resumo, tags=None):
     c = conn.cursor()
     c.execute("INSERT INTO estudos (cliente_id, titulo, resumo, tags) VALUES (?, ?, ?, ?)", (cid, titulo, resumo, tags))
     conn.commit()
-    eid = c.lastrowid
+    id = c.lastrowid
     conn.close()
-    return eid
+    return id
 
 def listar_estudos(cid):
     conn = get_conn()
@@ -466,30 +490,30 @@ def listar_estudos(cid):
     conn.close()
     return r
 
-def obter_estudo(eid):
+def obter_estudo(id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT * FROM estudos WHERE id = ?", (eid,))
+    c.execute("SELECT * FROM estudos WHERE id = ?", (id,))
     r = c.fetchone()
     conn.close()
     return r
 
-def atualizar_estudo(eid, titulo, resumo, tags):
+def atualizar_estudo(id, titulo, resumo, tags):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("UPDATE estudos SET titulo=?, resumo=?, tags=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (titulo, resumo, tags, eid))
+    c.execute("UPDATE estudos SET titulo=?, resumo=?, tags=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (titulo, resumo, tags, id))
     conn.commit()
     conn.close()
 
-def excluir_estudo(eid):
+def excluir_estudo(id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM anexos WHERE estudo_id = ?", (eid,))
-    c.execute("DELETE FROM estudos WHERE id = ?", (eid,))
+    c.execute("DELETE FROM anexos WHERE estudo_id = ?", (id,))
+    c.execute("DELETE FROM estudos WHERE id = ?", (id,))
     conn.commit()
     conn.close()
 
-def estudos_recentes(lim=5):
+def estudos_recentes(lim=10):
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT e.*, c.nome as cliente_nome FROM estudos e JOIN clientes c ON e.cliente_id = c.id ORDER BY e.created_at DESC LIMIT ?", (lim,))
@@ -500,70 +524,57 @@ def estudos_recentes(lim=5):
 def buscar_estudos(termo):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT e.*, c.nome as cliente_nome FROM estudos e JOIN clientes c ON e.cliente_id = c.id WHERE e.titulo LIKE ? OR e.resumo LIKE ? OR e.tags LIKE ? OR c.nome LIKE ? ORDER BY e.created_at DESC", (f"%{termo}%", f"%{termo}%", f"%{termo}%", f"%{termo}%"))
+    c.execute("SELECT e.*, c.nome as cliente_nome FROM estudos e JOIN clientes c ON e.cliente_id = c.id WHERE e.titulo LIKE ? OR e.resumo LIKE ? OR e.tags LIKE ? ORDER BY e.created_at DESC", (f"%{termo}%", f"%{termo}%", f"%{termo}%"))
     r = c.fetchall()
     conn.close()
     return r
 
-def add_anexo(eid, fname, ftype, fdata, fsize):
+def add_anexo(eid, nome, tipo, dados, tam):
     conn = get_conn()
     c = conn.cursor()
-    fb64 = base64.b64encode(fdata).decode('utf-8')
-    c.execute("INSERT INTO anexos (estudo_id, filename, file_type, file_data, file_size) VALUES (?, ?, ?, ?, ?)", (eid, fname, ftype, fb64, fsize))
+    c.execute("INSERT INTO anexos (estudo_id, filename, file_type, file_data, file_size) VALUES (?, ?, ?, ?, ?)", (eid, nome, tipo, base64.b64encode(dados).decode(), tam))
     conn.commit()
     conn.close()
 
 def listar_anexos(eid):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, filename, file_type, file_size, created_at FROM anexos WHERE estudo_id = ?", (eid,))
+    c.execute("SELECT id, filename, file_type, file_size FROM anexos WHERE estudo_id = ?", (eid,))
     r = c.fetchall()
     conn.close()
     return r
 
-def obter_anexo(aid):
+def obter_anexo(id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT * FROM anexos WHERE id = ?", (aid,))
+    c.execute("SELECT * FROM anexos WHERE id = ?", (id,))
     r = c.fetchone()
     conn.close()
     return r
 
-def excluir_anexo(aid):
+def excluir_anexo(id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM anexos WHERE id = ?", (aid,))
+    c.execute("DELETE FROM anexos WHERE id = ?", (id,))
     conn.commit()
     conn.close()
 
 def stats():
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM clientes")
-    tc = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM estudos")
-    te = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM anexos")
-    ta = c.fetchone()[0]
+    s = {}
+    for t, n in [("clientes", "clientes"), ("estudos", "estudos"), ("anexos", "anexos"), ("atualizacoes_tributarias", "atualizacoes")]:
+        c.execute(f"SELECT COUNT(*) FROM {t}")
+        s[n] = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM chat_historico WHERE role='user'")
-    th = c.fetchone()[0]
+    s["consultas"] = c.fetchone()[0]
     conn.close()
-    return {"clientes": tc, "estudos": te, "anexos": ta, "consultas": th}
+    return s
 
 def fmt_date(d):
-    if not d: return "N/A"
-    try: return datetime.fromisoformat(str(d)).strftime("%d/%m/%Y %H:%M")
-    except: return str(d)
-
-def file_icon(ft):
-    icons = {"application/pdf": "📕", "application/vnd.ms-excel": "📊", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "📊", "text/plain": "📝", "image/png": "🖼️", "image/jpeg": "🖼️"}
-    return icons.get(ft, "📎")
-
-def fmt_size(s):
-    if not s: return "N/A"
-    if s < 1024: return f"{s} B"
-    elif s < 1048576: return f"{s/1024:.1f} KB"
-    return f"{s/1048576:.1f} MB"
+    if not d: return ""
+    try: return datetime.fromisoformat(str(d)).strftime("%d/%m/%Y")
+    except: return str(d)[:10]
 
 # ==================== ESTADO ====================
 
@@ -571,9 +582,8 @@ if "pag" not in st.session_state: st.session_state.pag = "chat"
 if "cli" not in st.session_state: st.session_state.cli = None
 if "est" not in st.session_state: st.session_state.est = None
 if "edit" not in st.session_state: st.session_state.edit = False
-if "ultima_resposta" not in st.session_state: st.session_state.ultima_resposta = None
-if "ultimos_materiais" not in st.session_state: st.session_state.ultimos_materiais = []
-if "ultimas_fontes" not in st.session_state: st.session_state.ultimas_fontes = []
+if "materiais" not in st.session_state: st.session_state.materiais = []
+if "mostrar_historico" not in st.session_state: st.session_state.mostrar_historico = False
 
 def go(p, c=None, e=None):
     st.session_state.pag = p
@@ -581,24 +591,14 @@ def go(p, c=None, e=None):
     st.session_state.est = e
     st.session_state.edit = False
 
-# ==================== NAVEGAÇÃO SUPERIOR ====================
+# ==================== NAVEGAÇÃO ====================
 
-col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 2])
-with col1:
-    if st.button("🤖 Consultor IA", use_container_width=True, type="primary" if st.session_state.pag == "chat" else "secondary"):
-        go("chat")
-with col2:
-    if st.button("📚 Biblioteca", use_container_width=True, type="primary" if st.session_state.pag == "biblioteca" else "secondary"):
-        go("biblioteca")
-with col3:
-    if st.button("➕ Novo Estudo", use_container_width=True, type="primary" if st.session_state.pag == "novo" else "secondary"):
-        go("novo")
-with col4:
-    if st.button("👥 Clientes", use_container_width=True, type="primary" if st.session_state.pag == "clientes" else "secondary"):
-        go("clientes")
-with col5:
-    if st.button("⚙️ Config", use_container_width=True, type="primary" if st.session_state.pag == "config" else "secondary"):
-        go("config")
+cols = st.columns(6)
+botoes = [("🤖 Consultor", "chat"), ("📢 Atualizações", "atualizacoes"), ("📚 Biblioteca", "biblioteca"), ("➕ Novo", "novo"), ("👥 Clientes", "clientes"), ("⚙️ Config", "config")]
+for i, (label, pag) in enumerate(botoes):
+    with cols[i]:
+        if st.button(label, use_container_width=True, type="primary" if st.session_state.pag == pag else "secondary"):
+            go(pag)
 
 st.markdown("---")
 
@@ -606,316 +606,319 @@ st.markdown("---")
 
 if st.session_state.pag == "chat":
     st.markdown('<h1 class="main-header">🤖 Consultor Tributário IA</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">Pergunte sobre tributação, reforma tributária, ICMS, PIS/COFINS e muito mais.<br>Busco na sua biblioteca e em fontes oficiais.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Pergunte sobre tributação brasileira</p>', unsafe_allow_html=True)
     
-    # Container do chat
-    chat_container = st.container()
+    # Campo de pergunta principal
+    with st.form("chat", clear_on_submit=True):
+        pergunta = st.text_area("💬 Sua pergunta:", height=120, placeholder="Ex: Como funciona a substituição tributária de ICMS em operações interestaduais?")
+        col1, col2, col3 = st.columns([3, 1, 1])
+        with col1:
+            enviar = st.form_submit_button("🔍 Consultar", use_container_width=True, type="primary")
+        with col2:
+            ver_hist = st.form_submit_button("📜 Histórico", use_container_width=True)
+        with col3:
+            limpar = st.form_submit_button("🗑️ Limpar", use_container_width=True)
     
-    # Obter histórico
+    if ver_hist:
+        st.session_state.mostrar_historico = not st.session_state.mostrar_historico
+    
+    if limpar:
+        limpar_chat()
+        st.session_state.mostrar_historico = False
+        st.rerun()
+    
+    if enviar and pergunta.strip():
+        salvar_msg("user", pergunta)
+        with st.spinner("🔄 Pesquisando..."):
+            hist = [{"role": m["role"], "content": m["content"]} for m in obter_historico()[:-1]]
+            resposta, materiais, fontes = consultar_agente(pergunta, hist)
+            salvar_msg("assistant", resposta, fontes)
+            st.session_state.materiais = materiais
+        st.rerun()
+    
+    # Exibir última resposta
     historico = obter_historico()
-    
-    # Exibir histórico de mensagens
-    with chat_container:
-        for msg in historico[-20:]:  # Últimas 20 mensagens
+    if historico:
+        # Mostrar apenas última pergunta e resposta
+        ultimas = historico[-2:] if len(historico) >= 2 else historico
+        for msg in ultimas:
             if msg["role"] == "user":
                 st.markdown(f'<div class="user-message">🧑 {msg["content"]}</div>', unsafe_allow_html=True)
             else:
                 st.markdown(f'<div class="assistant-message">{msg["content"]}</div>', unsafe_allow_html=True)
-                
-                # Exibir fontes se houver
                 if msg.get("fontes"):
                     try:
                         fontes = json.loads(msg["fontes"])
                         if fontes:
-                            st.markdown("**🔗 Fontes consultadas:**")
+                            st.markdown("**🔗 Fontes oficiais:**")
                             for f in fontes:
-                                st.markdown(f'<div class="fonte-card"><a href="{f["url"]}" target="_blank">🏛️ {f["nome"]}</a> - {f["descricao"]}</div>', unsafe_allow_html=True)
-                    except:
-                        pass
-    
-    st.markdown("---")
-    
-    # Campo de input fixo no final
-    st.markdown("### 💬 Faça sua pergunta")
-    
-    with st.form("chat_form", clear_on_submit=True):
-        pergunta = st.text_area(
-            "Digite sua pergunta aqui:",
-            placeholder="Ex: Me explique sobre a reforma tributária e seus impactos no ICMS...\nOu: Tenho algum estudo sobre substituição tributária em SP?",
-            height=100,
-            label_visibility="collapsed"
-        )
+                                st.markdown(f"- [{f['nome']}]({f['url']}) - {f['descricao']}")
+                    except: pass
         
-        col1, col2, col3 = st.columns([4, 1, 1])
-        with col1:
-            submit = st.form_submit_button("🔍 Enviar Pergunta", use_container_width=True, type="primary")
-        with col2:
-            nova_conversa = st.form_submit_button("🗑️ Nova", use_container_width=True)
+        # Materiais relacionados
+        if st.session_state.materiais:
+            st.markdown("---")
+            st.markdown("### 📚 Na sua biblioteca")
+            for m in st.session_state.materiais:
+                st.markdown(f'<div class="biblioteca-card">📄 **{m["titulo"]}** ({m["cliente_nome"]})</div>', unsafe_allow_html=True)
     
-    # Processar nova conversa
-    if nova_conversa:
-        limpar_historico()
-        st.rerun()
-    
-    # Processar pergunta
-    if submit and pergunta.strip():
-        # Salvar pergunta do usuário
-        salvar_mensagem("user", pergunta)
-        
-        with st.spinner("🔄 Pesquisando na biblioteca e fontes oficiais..."):
-            # Obter histórico atualizado para contexto
-            hist_mensagens = [{"role": m["role"], "content": m["content"]} for m in obter_historico()]
-            
-            # Consultar agente
-            resposta, materiais, fontes = consultar_agente(pergunta, hist_mensagens[:-1])  # Excluir a última (já está na pergunta)
-            
-            # Salvar resposta
-            salvar_mensagem("assistant", resposta, fontes)
-            
-            st.session_state.ultimos_materiais = materiais
-            st.session_state.ultimas_fontes = fontes
-        
-        st.rerun()
-    
-    # Mostrar materiais da biblioteca encontrados (última consulta)
-    if st.session_state.ultimos_materiais:
+    # Histórico oculto (só mostra se solicitado)
+    if st.session_state.mostrar_historico and len(historico) > 2:
         st.markdown("---")
-        st.markdown("### �� Materiais relacionados na sua biblioteca")
-        for m in st.session_state.ultimos_materiais:
-            st.markdown(f"""
-            <div class="biblioteca-card">
-                <strong>📄 {m['titulo']}</strong><br>
-                <small>Cliente: {m['cliente_nome']} | Tags: {m['tags'] or 'Sem tags'}</small><br>
-                <small>{m['resumo'][:150]}...</small>
-            </div>
-            """, unsafe_allow_html=True)
+        st.markdown("### 📜 Histórico de Conversas")
+        for msg in historico[:-2]:
+            with st.expander(f"{'🧑 Você' if msg['role'] == 'user' else '🤖 Assistente'}: {msg['content'][:50]}..."):
+                st.markdown(msg["content"])
 
-elif st.session_state.pag == "biblioteca":
-    st.markdown("## �� Biblioteca de Estudos")
+elif st.session_state.pag == "atualizacoes":
+    st.markdown('<div class="atualizacao-header"><h1>📢 Atualizações Tributárias</h1><p>Legislação tributária em tempo real</p></div>', unsafe_allow_html=True)
     
-    # Busca
-    busca = st.text_input("🔍 Buscar estudos", placeholder="Digite para buscar...")
+    # Busca por período
+    st.markdown("### 🔎 Buscar Atualizações")
     
-    if busca:
-        resultados = buscar_estudos(busca)
-        st.markdown(f"### Resultados para '{busca}' ({len(resultados)})")
-    else:
-        resultados = estudos_recentes(20)
-        st.markdown("### Estudos Recentes")
-    
-    if resultados:
-        for r in resultados:
-            with st.expander(f"📄 {r['titulo']} - {r['cliente_nome']}"):
-                st.markdown(f"**Cliente:** {r['cliente_nome']}")
-                st.markdown(f"**Data:** {fmt_date(r['created_at'])}")
-                if r['tags']:
-                    st.markdown("**Tags:** " + " ".join([f'`{t.strip()}`' for t in r['tags'].split(",")]))
-                st.markdown("**Resumo:**")
-                st.markdown(r['resumo'][:500] + "..." if len(r['resumo']) > 500 else r['resumo'])
-                
-                if st.button("Abrir completo", key=f"abrir_{r['id']}"):
-                    go("estudo", r['cliente_id'], r['id'])
-                    st.rerun()
-    else:
-        st.info("Nenhum estudo encontrado.")
-
-elif st.session_state.pag == "novo":
-    st.markdown("## ➕ Novo Cadastro")
-    
-    t1, t2 = st.tabs(["📄 Novo Estudo", "👤 Novo Cliente"])
-    
-    with t1:
-        cls = listar_clientes()
-        if not cls:
-            st.warning("⚠️ Cadastre um cliente primeiro na aba 'Novo Cliente'")
-        else:
-            with st.form("form_estudo"):
-                opts = {c['nome']: c['id'] for c in cls}
-                cliente = st.selectbox("Cliente *", list(opts.keys()))
-                titulo = st.text_input("Título do Estudo *")
-                resumo = st.text_area("Resumo / Conteúdo *", height=300, placeholder="Descreva o estudo tributário em detalhes...")
-                tags = st.text_input("Tags (separadas por vírgula)", placeholder="ICMS, ST, SP, Reforma")
-                arquivos = st.file_uploader("📎 Anexos", accept_multiple_files=True, type=["pdf", "xls", "xlsx", "doc", "docx", "txt", "csv", "png", "jpg"])
-                
-                if st.form_submit_button("💾 Salvar Estudo", use_container_width=True, type="primary"):
-                    if not titulo or not resumo:
-                        st.error("Título e Resumo são obrigatórios!")
-                    else:
-                        eid = criar_estudo(opts[cliente], titulo, resumo, tags)
-                        if arquivos:
-                            for a in arquivos:
-                                add_anexo(eid, a.name, a.type or "application/octet-stream", a.read(), a.size)
-                        st.success(f"✅ Estudo '{titulo}' criado!")
-                        st.balloons()
-    
-    with t2:
-        with st.form("form_cliente"):
-            nome = st.text_input("Nome do Cliente *")
-            cnpj = st.text_input("CNPJ")
-            obs = st.text_area("Observações")
-            
-            if st.form_submit_button("💾 Salvar Cliente", use_container_width=True, type="primary"):
-                if not nome:
-                    st.error("Nome é obrigatório!")
-                else:
-                    criar_cliente(nome, cnpj, obs)
-                    st.success(f"✅ Cliente '{nome}' cadastrado!")
-                    st.balloons()
-
-elif st.session_state.pag == "clientes":
-    st.markdown("## 👥 Clientes")
-    
-    clientes = listar_clientes()
-    
-    if clientes:
-        for cl in clientes:
-            with st.expander(f"📁 {cl['nome']}" + (f" - CNPJ: {cl['cnpj']}" if cl['cnpj'] else "")):
-                estudos = listar_estudos(cl['id'])
-                st.markdown(f"**Estudos:** {len(estudos)}")
-                
-                if cl['observacoes']:
-                    st.markdown(f"**Obs:** {cl['observacoes']}")
-                
-                if estudos:
-                    st.markdown("**Estudos:**")
-                    for e in estudos[:5]:
-                        if st.button(f"📄 {e['titulo']}", key=f"est_{cl['id']}_{e['id']}"):
-                            go("estudo", cl['id'], e['id'])
-                            st.rerun()
-                
-                if st.button("🗑️ Excluir Cliente", key=f"del_cli_{cl['id']}"):
-                    excluir_cliente(cl['id'])
-                    st.rerun()
-    else:
-        st.info("Nenhum cliente cadastrado. Vá em 'Novo Estudo' para cadastrar.")
-
-elif st.session_state.pag == "config":
-    st.markdown("## ⚙️ Configurações")
-    
-    # Status
-    col1, col2, col3, col4 = st.columns(4)
-    s = stats()
-    with col1: st.metric("Clientes", s["clientes"])
-    with col2: st.metric("Estudos", s["estudos"])
-    with col3: st.metric("Anexos", s["anexos"])
-    with col4: st.metric("Consultas IA", s["consultas"])
-    
-    st.markdown("---")
-    
-    # API Status
-    st.markdown("### 🔑 API OpenAI")
-    if client:
-        st.success("✅ Conectada e funcionando")
-    else:
-        st.error("❌ Não configurada - adicione a chave em .streamlit/secrets.toml")
-    
-    st.markdown("---")
-    
-    # Backup
-    st.markdown("### 💾 Backup")
     col1, col2 = st.columns(2)
-    
     with col1:
-        if st.button("📥 Gerar Backup", use_container_width=True):
-            backup = criar_backup()
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.download_button("⬇️ Baixar Backup", backup, f"backup_{ts}.zip", "application/zip", use_container_width=True)
+        data_ini = st.date_input("De:", value=datetime.now() - timedelta(days=7))
+    with col2:
+        data_fim = st.date_input("Até:", value=datetime.now())
+    
+    # Seleção de fontes
+    todas_fontes = ["Receita Federal", "Planalto", "SEFAZ ES", "SEFAZ SC", "SEFAZ PR", "SEFAZ MG", "SEFAZ RJ", "SEFAZ PE", "SEFAZ CE", "CONFAZ", "Diário Oficial"]
+    fontes_sel = st.multiselect("Fontes:", todas_fontes, default=todas_fontes[:5])
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("🔍 Buscar Atualizações", use_container_width=True, type="primary"):
+            if fontes_sel:
+                atualizacoes = buscar_todas_atualizacoes(
+                    data_ini.strftime("%Y-%m-%d"),
+                    data_fim.strftime("%Y-%m-%d"),
+                    fontes_sel
+                )
+                if atualizacoes:
+                    novos = salvar_atualizacoes(atualizacoes)
+                    st.success(f"✅ {len(atualizacoes)} atualizações encontradas, {novos} novas!")
+                else:
+                    st.warning("Nenhuma atualização encontrada no período")
+                st.rerun()
+            else:
+                st.warning("Selecione pelo menos uma fonte")
     
     with col2:
-        uploaded = st.file_uploader("Restaurar backup", type=["zip", "json"])
-        if uploaded:
-            if st.button("📤 Restaurar", use_container_width=True, type="primary"):
-                ok, msg = restaurar_backup(uploaded)
+        if st.button("📧 Enviar por Email", use_container_width=True):
+            atts = obter_atualizacoes_db()
+            if atts:
+                ok, msg = enviar_email_atualizacoes(atts, f"({data_ini} a {data_fim})")
                 if ok:
                     st.success(f"✅ {msg}")
                 else:
                     st.error(f"❌ {msg}")
+            else:
+                st.warning("Nenhuma atualização para enviar")
+    
+    with col3:
+        if st.button("🗑️ Limpar Base", use_container_width=True):
+            limpar_atualizacoes()
+            st.success("Base limpa!")
+            st.rerun()
+    
+    # Exibir atualizações
+    st.markdown("---")
+    atts = obter_atualizacoes_db()
+    
+    if atts:
+        st.markdown(f"### 📋 {len(atts)} Atualizações Cadastradas")
+        
+        por_fonte = {}
+        for a in atts:
+            f = a.get("fonte", "Outros")
+            if f not in por_fonte:
+                por_fonte[f] = []
+            por_fonte[f].append(a)
+        
+        for fonte, lista in por_fonte.items():
+            with st.expander(f"🏛️ {fonte} ({len(lista)})", expanded=True):
+                for a in lista:
+                    st.markdown(f"""
+                    <div class="atualizacao-card">
+                        <h4>{a.get('titulo', '')}</h4>
+                        <p><strong>📅</strong> {a.get('data_publicacao', '')}</p>
+                        <p>{a.get('resumo', '')}</p>
+                        <p><a href="{a.get('link', '#')}" target="_blank">🔗 Acessar documento</a></p>
+                    </div>
+                    """, unsafe_allow_html=True)
+    else:
+        st.info("Clique em 'Buscar Atualizações' para começar")
+
+elif st.session_state.pag == "biblioteca":
+    st.markdown("## 📚 Biblioteca")
+    
+    busca = st.text_input("🔍 Buscar", placeholder="Digite...")
+    resultados = buscar_estudos(busca) if busca else estudos_recentes(20)
+    
+    if resultados:
+        for r in resultados:
+            with st.expander(f"📄 {r['titulo']} - {r['cliente_nome']}"):
+                st.markdown(f"**Data:** {fmt_date(r['created_at'])}")
+                if r['tags']:
+                    st.markdown(" ".join([f"`{t.strip()}`" for t in r['tags'].split(",")]))
+                st.markdown(r['resumo'][:500])
+                if st.button("Abrir", key=f"o_{r['id']}"):
+                    go("estudo", r['cliente_id'], r['id'])
+                    st.rerun()
+    else:
+        st.info("Nenhum estudo")
+
+elif st.session_state.pag == "novo":
+    st.markdown("## ➕ Novo")
+    
+    t1, t2 = st.tabs(["📄 Estudo", "👤 Cliente"])
+    
+    with t1:
+        cls = listar_clientes()
+        if not cls:
+            st.warning("Cadastre um cliente primeiro")
+        else:
+            with st.form("est"):
+                opts = {c['nome']: c['id'] for c in cls}
+                cliente = st.selectbox("Cliente", list(opts.keys()))
+                titulo = st.text_input("Título")
+                resumo = st.text_area("Resumo", height=250)
+                tags = st.text_input("Tags (vírgula)")
+                arqs = st.file_uploader("Anexos", accept_multiple_files=True)
+                if st.form_submit_button("💾 Salvar", type="primary"):
+                    if titulo and resumo:
+                        eid = criar_estudo(opts[cliente], titulo, resumo, tags)
+                        for a in arqs:
+                            add_anexo(eid, a.name, a.type or "", a.read(), a.size)
+                        st.success("✅ Criado!")
+                        st.balloons()
+                    else:
+                        st.error("Preencha título e resumo")
+    
+    with t2:
+        with st.form("cli"):
+            nome = st.text_input("Nome")
+            cnpj = st.text_input("CNPJ")
+            obs = st.text_area("Obs")
+            if st.form_submit_button("💾 Salvar", type="primary"):
+                if nome:
+                    criar_cliente(nome, cnpj, obs)
+                    st.success("✅ Criado!")
+                else:
+                    st.error("Nome obrigatório")
+
+elif st.session_state.pag == "clientes":
+    st.markdown("## 👥 Clientes")
+    
+    for cl in listar_clientes():
+        with st.expander(f"📁 {cl['nome']}" + (f" - {cl['cnpj']}" if cl['cnpj'] else "")):
+            estudos = listar_estudos(cl['id'])
+            st.write(f"{len(estudos)} estudos")
+            for e in estudos[:5]:
+                if st.button(f"📄 {e['titulo'][:40]}", key=f"e_{cl['id']}_{e['id']}"):
+                    go("estudo", cl['id'], e['id'])
+                    st.rerun()
+            if st.button("🗑️ Excluir", key=f"d_{cl['id']}"):
+                excluir_cliente(cl['id'])
+                st.rerun()
+
+elif st.session_state.pag == "config":
+    st.markdown("## ⚙️ Configurações")
+    
+    s = stats()
+    cols = st.columns(5)
+    for i, (k, v) in enumerate(s.items()):
+        with cols[i]:
+            st.metric(k.title(), v)
+    
+    st.markdown("---")
+    st.markdown("### 🔑 APIs")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.success("✅ OpenAI OK" if client else "❌ OpenAI não configurada")
+    with col2:
+        st.success(f"✅ Email: {GMAIL_USER}" if GMAIL_USER else "❌ Email não configurado")
+    
+    st.markdown("---")
+    st.markdown("### 💾 Backup")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("�� Gerar", use_container_width=True):
+            st.download_button("⬇️ Baixar", criar_backup(), f"backup_{datetime.now():%Y%m%d_%H%M}.zip", "application/zip")
+    with col2:
+        up = st.file_uploader("Restaurar", type=["zip", "json"])
+        if up and st.button("📤 Restaurar"):
+            ok, msg = restaurar_backup(up)
+            st.success(msg) if ok else st.error(msg)
 
 elif st.session_state.pag == "estudo":
     est = obter_estudo(st.session_state.est)
     cl = obter_cliente(st.session_state.cli)
     
     if est and cl:
-        # Cabeçalho
         col1, col2, col3 = st.columns([4, 1, 1])
         with col1:
             st.markdown(f"## 📖 {est['titulo']}")
             st.caption(f"👤 {cl['nome']} | 📅 {fmt_date(est['created_at'])}")
         with col2:
-            if st.button("✏️ Editar"):
+            if st.button("✏️"):
                 st.session_state.edit = True
                 st.rerun()
         with col3:
-            if st.button("🗑️ Excluir"):
+            if st.button("��️"):
                 excluir_estudo(est['id'])
                 go("biblioteca")
                 st.rerun()
         
-        # Tags
         if est['tags']:
             st.markdown(" ".join([f'<span class="tag">{t.strip()}</span>' for t in est['tags'].split(",")]), unsafe_allow_html=True)
         
         st.markdown("---")
         
-        # Modo edição
         if st.session_state.edit:
-            with st.form("form_editar"):
-                novo_titulo = st.text_input("Título", value=est['titulo'])
-                novo_resumo = st.text_area("Resumo", value=est['resumo'], height=400)
-                novas_tags = st.text_input("Tags", value=est['tags'] or "")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.form_submit_button("💾 Salvar", use_container_width=True, type="primary"):
-                        atualizar_estudo(est['id'], novo_titulo, novo_resumo, novas_tags)
+            with st.form("ed"):
+                t = st.text_input("Título", est['titulo'])
+                r = st.text_area("Resumo", est['resumo'], height=300)
+                tg = st.text_input("Tags", est['tags'] or "")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.form_submit_button("💾"):
+                        atualizar_estudo(est['id'], t, r, tg)
                         st.session_state.edit = False
                         st.rerun()
-                with col2:
-                    if st.form_submit_button("❌ Cancelar", use_container_width=True):
+                with c2:
+                    if st.form_submit_button("❌"):
                         st.session_state.edit = False
                         st.rerun()
         else:
-            st.markdown("### 📋 Conteúdo")
             st.markdown(est['resumo'])
         
-        # Anexos
         st.markdown("---")
         st.markdown("### 📎 Anexos")
-        
-        anexos = listar_anexos(est['id'])
-        if anexos:
-            for a in anexos:
-                col1, col2, col3 = st.columns([4, 1, 1])
-                with col1:
-                    st.markdown(f"{file_icon(a['file_type'])} **{a['filename']}** ({fmt_size(a['file_size'])})")
-                with col2:
-                    anx_data = obter_anexo(a['id'])
-                    if anx_data:
-                        st.download_button("⬇️", base64.b64decode(anx_data['file_data']), a['filename'], a['file_type'], key=f"dl_{a['id']}")
-                with col3:
-                    if st.button("🗑️", key=f"del_{a['id']}"):
-                        excluir_anexo(a['id'])
-                        st.rerun()
-        else:
-            st.info("Nenhum anexo")
-        
-        # Upload de novos anexos
-        with st.form("form_anexos", clear_on_submit=True):
-            novos = st.file_uploader("Adicionar anexos", accept_multiple_files=True, type=["pdf", "xls", "xlsx", "doc", "docx", "txt", "png", "jpg"])
-            if st.form_submit_button("📤 Enviar", use_container_width=True):
-                if novos:
-                    for a in novos:
-                        content = a.read()
-                        add_anexo(est['id'], a.name, a.type or "application/octet-stream", content, len(content))
-                    st.success(f"✅ {len(novos)} arquivo(s) adicionado(s)!")
+        for a in listar_anexos(est['id']):
+            c1, c2, c3 = st.columns([4, 1, 1])
+            with c1:
+                st.write(f"📄 {a['filename']}")
+            with c2:
+                anx = obter_anexo(a['id'])
+                if anx:
+                    st.download_button("⬇️", base64.b64decode(anx['file_data']), a['filename'], a['file_type'], key=f"dl_{a['id']}")
+            with c3:
+                if st.button("🗑️", key=f"x_{a['id']}"):
+                    excluir_anexo(a['id'])
                     st.rerun()
         
-        # Botão voltar
-        st.markdown("---")
-        if st.button("← Voltar para Biblioteca"):
+        with st.form("anx", clear_on_submit=True):
+            novos = st.file_uploader("Adicionar", accept_multiple_files=True)
+            if st.form_submit_button("📤") and novos:
+                for a in novos:
+                    add_anexo(est['id'], a.name, a.type or "", a.read(), a.size)
+                st.rerun()
+        
+        if st.button("← Voltar"):
             go("biblioteca")
             st.rerun()
 
-# Footer
 st.markdown("---")
-st.caption("📚 Biblioteca Tributária | 🤖 Consultor IA Integrado")
+st.caption("📚 Biblioteca Tributária | 🤖 IA | 📢 Atualizações")
