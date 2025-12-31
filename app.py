@@ -6,10 +6,9 @@ import base64
 import json
 import zipfile
 import io
-import requests
 from openai import OpenAI
 
-st.set_page_config(page_title="Biblioteca Tributária", page_icon="📚", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Biblioteca Tributária", page_icon="📚", layout="wide", initial_sidebar_state="collapsed")
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "biblioteca.db"
@@ -21,16 +20,38 @@ except:
     client = None
 
 st.markdown("""<style>
-.main-header {font-size: 2.2rem; font-weight: bold; color: #1f4e79; margin-bottom: 1rem; text-align: center;}
+/* Geral */
+.main-header {font-size: 2.5rem; font-weight: bold; color: #1f4e79; margin-bottom: 0.5rem; text-align: center;}
+.sub-header {font-size: 1.1rem; color: #666; text-align: center; margin-bottom: 2rem;}
+
+/* Cards de estatísticas */
 .stat-card {background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 12px; padding: 1.5rem; color: white; text-align: center;}
 .stat-number {font-size: 2.5rem; font-weight: bold;}
 .stat-label {font-size: 0.9rem; opacity: 0.9;}
-.tag {display: inline-block; background-color: #e3f2fd; color: #1565c0; padding: 0.2rem 0.6rem; border-radius: 15px; font-size: 0.8rem; margin-right: 0.3rem;}
+
+/* Tags */
+.tag {display: inline-block; background-color: #e3f2fd; color: #1565c0; padding: 0.2rem 0.6rem; border-radius: 15px; font-size: 0.8rem; margin-right: 0.3rem; margin-bottom: 0.3rem;}
+
+/* Chat */
+.chat-container {max-width: 900px; margin: 0 auto; padding: 20px;}
+.user-message {background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px 20px; border-radius: 20px 20px 5px 20px; margin: 10px 0; margin-left: 15%;}
+.assistant-message {background-color: #f7f7f8; padding: 15px 20px; border-radius: 20px 20px 20px 5px; margin: 10px 0; margin-right: 15%; border: 1px solid #e5e5e5;}
+.fonte-card {background-color: #f0f9ff; border-left: 4px solid #0ea5e9; padding: 12px 15px; margin: 8px 0; border-radius: 0 8px 8px 0;}
+.fonte-card a {color: #0369a1; text-decoration: none; font-weight: 500;}
+.fonte-card a:hover {text-decoration: underline;}
+.biblioteca-card {background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 15px; margin: 8px 0; border-radius: 0 8px 8px 0;}
+
+/* Input de chat */
+.stTextArea textarea {font-size: 16px !important; border-radius: 15px !important;}
+
+/* Botões */
+.stButton button {border-radius: 10px !important;}
+
+/* Backup */
 .backup-box {background-color: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 1rem; margin: 1rem 0;}
-.chat-user {background-color: #e3f2fd; padding: 10px 15px; border-radius: 15px; margin: 5px 0; margin-left: 20%;}
-.chat-assistant {background-color: #f0f0f0; padding: 10px 15px; border-radius: 15px; margin: 5px 0; margin-right: 20%;}
-.fonte-oficial {background-color: #e8f5e9; border-left: 4px solid #4caf50; padding: 10px; margin: 5px 0; border-radius: 0 8px 8px 0;}
-.material-sugerido {background-color: #fff3e0; border-left: 4px solid #ff9800; padding: 10px; margin: 5px 0; border-radius: 0 8px 8px 0;}
+
+/* Esconder menu hamburguer quando sidebar está collapsed */
+section[data-testid="stSidebar"][aria-expanded="false"] {display: none;}
 </style>""", unsafe_allow_html=True)
 
 def get_conn():
@@ -44,190 +65,298 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS clientes (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT NOT NULL, cnpj TEXT, observacoes TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     c.execute("CREATE TABLE IF NOT EXISTS estudos (id INTEGER PRIMARY KEY AUTOINCREMENT, cliente_id INTEGER NOT NULL, titulo TEXT NOT NULL, resumo TEXT NOT NULL, tags TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE CASCADE)")
     c.execute("CREATE TABLE IF NOT EXISTS anexos (id INTEGER PRIMARY KEY AUTOINCREMENT, estudo_id INTEGER NOT NULL, filename TEXT NOT NULL, file_type TEXT NOT NULL, file_data TEXT NOT NULL, file_size INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (estudo_id) REFERENCES estudos(id) ON DELETE CASCADE)")
-    c.execute("CREATE TABLE IF NOT EXISTS chat_historico (id INTEGER PRIMARY KEY AUTOINCREMENT, pergunta TEXT NOT NULL, resposta TEXT NOT NULL, fontes TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    c.execute("CREATE TABLE IF NOT EXISTS chat_historico (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, content TEXT NOT NULL, fontes TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     conn.commit()
     conn.close()
 
 init_db()
 
-# ==================== FUNÇÕES DO AGENTE ====================
+# ==================== FONTES OFICIAIS ====================
 
 FONTES_OFICIAIS = {
-    "Receita Federal": "https://www.gov.br/receitafederal",
-    "Planalto - Legislação": "https://www.planalto.gov.br/legislacao",
-    "SEFAZ SC": "https://www.sef.sc.gov.br",
-    "SEFAZ ES": "https://www.sefaz.es.gov.br",
-    "SEFAZ MG": "https://www.fazenda.mg.gov.br",
-    "SEFAZ SP": "https://portal.fazenda.sp.gov.br",
-    "SEFAZ RJ": "https://www.fazenda.rj.gov.br",
-    "SEFAZ PE": "https://www.sefaz.pe.gov.br",
-    "SEFAZ CE": "https://www.sefaz.ce.gov.br",
+    "Receita Federal": {
+        "url": "https://www.gov.br/receitafederal",
+        "descricao": "Tributos federais, IRPJ, CSLL, PIS, COFINS, IPI"
+    },
+    "Planalto - Legislação": {
+        "url": "https://www.planalto.gov.br/ccivil_03/leis/",
+        "descricao": "Leis federais, Código Tributário Nacional"
+    },
+    "Portal da Reforma Tributária": {
+        "url": "https://www.gov.br/fazenda/pt-br/acesso-a-informacao/acoes-e-programas/reforma-tributaria",
+        "descricao": "Informações oficiais sobre a Reforma Tributária"
+    },
+    "SEFAZ SC": {
+        "url": "https://www.sef.sc.gov.br",
+        "descricao": "ICMS Santa Catarina, TTD, benefícios fiscais"
+    },
+    "SEFAZ ES": {
+        "url": "https://www.sefaz.es.gov.br",
+        "descricao": "ICMS Espírito Santo, INVEST-ES"
+    },
+    "SEFAZ MG": {
+        "url": "https://www.fazenda.mg.gov.br",
+        "descricao": "ICMS Minas Gerais, RICMS/MG"
+    },
+    "SEFAZ SP": {
+        "url": "https://portal.fazenda.sp.gov.br",
+        "descricao": "ICMS São Paulo, RICMS/SP, ST"
+    },
+    "SEFAZ RJ": {
+        "url": "https://www.fazenda.rj.gov.br",
+        "descricao": "ICMS Rio de Janeiro"
+    },
+    "SEFAZ PE": {
+        "url": "https://www.sefaz.pe.gov.br",
+        "descricao": "ICMS Pernambuco"
+    },
+    "SEFAZ CE": {
+        "url": "https://www.sefaz.ce.gov.br",
+        "descricao": "ICMS Ceará"
+    },
+    "CONFAZ": {
+        "url": "https://www.confaz.fazenda.gov.br",
+        "descricao": "Convênios ICMS, protocolos, ajustes SINIEF"
+    },
+    "STF - Supremo Tribunal Federal": {
+        "url": "https://portal.stf.jus.br",
+        "descricao": "Jurisprudência tributária, ADIs"
+    },
+    "STJ - Superior Tribunal de Justiça": {
+        "url": "https://www.stj.jus.br",
+        "descricao": "Jurisprudência tributária, REsp"
+    },
 }
 
-def buscar_na_biblioteca(termo):
+def buscar_na_biblioteca(pergunta):
     """Busca estudos relacionados na biblioteca local"""
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT e.id, e.titulo, e.resumo, e.tags, c.nome as cliente_nome 
-        FROM estudos e 
-        JOIN clientes c ON e.cliente_id = c.id 
-        WHERE e.titulo LIKE ? OR e.resumo LIKE ? OR e.tags LIKE ? OR c.nome LIKE ?
-        ORDER BY e.created_at DESC LIMIT 5
-    """, (f"%{termo}%", f"%{termo}%", f"%{termo}%", f"%{termo}%"))
-    resultados = c.fetchall()
+    
+    # Extrair palavras-chave
+    palavras = [p.strip().lower() for p in pergunta.split() if len(p) > 3]
+    
+    resultados = []
+    ids_vistos = set()
+    
+    for palavra in palavras:
+        c.execute("""
+            SELECT e.id, e.titulo, e.resumo, e.tags, c.nome as cliente_nome 
+            FROM estudos e 
+            JOIN clientes c ON e.cliente_id = c.id 
+            WHERE LOWER(e.titulo) LIKE ? OR LOWER(e.resumo) LIKE ? OR LOWER(e.tags) LIKE ?
+            ORDER BY e.created_at DESC LIMIT 5
+        """, (f"%{palavra}%", f"%{palavra}%", f"%{palavra}%"))
+        
+        for row in c.fetchall():
+            if row['id'] not in ids_vistos:
+                resultados.append(dict(row))
+                ids_vistos.add(row['id'])
+    
     conn.close()
-    return resultados
+    return resultados[:5]
+
+def identificar_fontes_relevantes(pergunta):
+    """Identifica fontes oficiais relevantes para a pergunta"""
+    pergunta_lower = pergunta.lower()
+    fontes = []
+    
+    # Palavras-chave para cada fonte
+    mapeamento = {
+        "reforma tributária": ["Portal da Reforma Tributária", "Receita Federal", "Planalto - Legislação"],
+        "reforma": ["Portal da Reforma Tributária", "Receita Federal"],
+        "ibs": ["Portal da Reforma Tributária", "CONFAZ"],
+        "cbs": ["Portal da Reforma Tributária", "Receita Federal"],
+        "split payment": ["Portal da Reforma Tributária"],
+        "icms": ["CONFAZ"],
+        "icms sc": ["SEFAZ SC", "CONFAZ"],
+        "icms es": ["SEFAZ ES", "CONFAZ"],
+        "icms mg": ["SEFAZ MG", "CONFAZ"],
+        "icms sp": ["SEFAZ SP", "CONFAZ"],
+        "icms rj": ["SEFAZ RJ", "CONFAZ"],
+        "icms pe": ["SEFAZ PE", "CONFAZ"],
+        "icms ce": ["SEFAZ CE", "CONFAZ"],
+        "santa catarina": ["SEFAZ SC"],
+        "espírito santo": ["SEFAZ ES"],
+        "espirito santo": ["SEFAZ ES"],
+        "minas gerais": ["SEFAZ MG"],
+        "são paulo": ["SEFAZ SP"],
+        "sao paulo": ["SEFAZ SP"],
+        "rio de janeiro": ["SEFAZ RJ"],
+        "pernambuco": ["SEFAZ PE"],
+        "ceará": ["SEFAZ CE"],
+        "ceara": ["SEFAZ CE"],
+        "pis": ["Receita Federal"],
+        "cofins": ["Receita Federal"],
+        "irpj": ["Receita Federal"],
+        "csll": ["Receita Federal"],
+        "ipi": ["Receita Federal"],
+        "federal": ["Receita Federal", "Planalto - Legislação"],
+        "lei": ["Planalto - Legislação"],
+        "decreto": ["Planalto - Legislação"],
+        "convênio": ["CONFAZ"],
+        "protocolo": ["CONFAZ"],
+        "substituição tributária": ["CONFAZ", "SEFAZ SP"],
+        "st": ["CONFAZ"],
+        "difal": ["CONFAZ"],
+        "stf": ["STF - Supremo Tribunal Federal"],
+        "supremo": ["STF - Supremo Tribunal Federal"],
+        "stj": ["STJ - Superior Tribunal de Justiça"],
+        "jurisprudência": ["STF - Supremo Tribunal Federal", "STJ - Superior Tribunal de Justiça"],
+    }
+    
+    fontes_adicionadas = set()
+    
+    for termo, lista_fontes in mapeamento.items():
+        if termo in pergunta_lower:
+            for fonte in lista_fontes:
+                if fonte not in fontes_adicionadas:
+                    fontes.append({
+                        "nome": fonte,
+                        "url": FONTES_OFICIAIS[fonte]["url"],
+                        "descricao": FONTES_OFICIAIS[fonte]["descricao"]
+                    })
+                    fontes_adicionadas.add(fonte)
+    
+    # Sempre adicionar Receita Federal e Planalto para questões tributárias
+    if not fontes:
+        fontes.append({
+            "nome": "Receita Federal",
+            "url": FONTES_OFICIAIS["Receita Federal"]["url"],
+            "descricao": FONTES_OFICIAIS["Receita Federal"]["descricao"]
+        })
+        fontes.append({
+            "nome": "Planalto - Legislação",
+            "url": FONTES_OFICIAIS["Planalto - Legislação"]["url"],
+            "descricao": FONTES_OFICIAIS["Planalto - Legislação"]["descricao"]
+        })
+    
+    return fontes[:6]
 
 def obter_contexto_biblioteca():
-    """Obtém resumo de toda a biblioteca para contexto"""
+    """Obtém resumo da biblioteca para contexto"""
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
         SELECT e.titulo, e.resumo, e.tags, c.nome as cliente_nome 
         FROM estudos e 
         JOIN clientes c ON e.cliente_id = c.id 
-        ORDER BY e.created_at DESC LIMIT 20
+        ORDER BY e.created_at DESC LIMIT 15
     """)
     estudos = c.fetchall()
     conn.close()
     
     if not estudos:
-        return "A biblioteca está vazia."
+        return "Biblioteca vazia - nenhum estudo cadastrado ainda."
     
-    contexto = "ESTUDOS DISPONÍVEIS NA BIBLIOTECA:\n\n"
+    contexto = ""
     for est in estudos:
-        contexto += f"- **{est['titulo']}** (Cliente: {est['cliente_nome']})\n"
-        contexto += f"  Tags: {est['tags'] or 'Sem tags'}\n"
-        contexto += f"  Resumo: {est['resumo'][:200]}...\n\n"
+        contexto += f"• {est['titulo']} (Cliente: {est['cliente_nome']}, Tags: {est['tags'] or 'sem tags'})\n"
     
     return contexto
 
-def gerar_links_fontes(pergunta):
-    """Gera links relevantes baseado na pergunta"""
-    links = []
-    pergunta_lower = pergunta.lower()
-    
-    # Sempre incluir fontes federais para questões tributárias
-    links.append(("Receita Federal", FONTES_OFICIAIS["Receita Federal"]))
-    links.append(("Legislação Federal", FONTES_OFICIAIS["Planalto - Legislação"]))
-    
-    # Detectar estados mencionados
-    estados = {
-        "sc": "SEFAZ SC", "santa catarina": "SEFAZ SC",
-        "es": "SEFAZ ES", "espirito santo": "SEFAZ ES", "espírito santo": "SEFAZ ES",
-        "mg": "SEFAZ MG", "minas": "SEFAZ MG", "minas gerais": "SEFAZ MG",
-        "sp": "SEFAZ SP", "são paulo": "SEFAZ SP", "sao paulo": "SEFAZ SP",
-        "rj": "SEFAZ RJ", "rio de janeiro": "SEFAZ RJ",
-        "pe": "SEFAZ PE", "pernambuco": "SEFAZ PE",
-        "ce": "SEFAZ CE", "ceará": "SEFAZ CE", "ceara": "SEFAZ CE",
-    }
-    
-    for termo, sefaz in estados.items():
-        if termo in pergunta_lower:
-            links.append((sefaz, FONTES_OFICIAIS[sefaz]))
-    
-    # Se mencionar ICMS, IPI, ISS, etc., adicionar SEFAZ relevantes
-    if any(imp in pergunta_lower for imp in ["icms", "difal", "substituição", "st", "antecipação"]):
-        for sefaz in ["SEFAZ SP", "SEFAZ MG", "SEFAZ RJ"]:
-            if (sefaz, FONTES_OFICIAIS[sefaz]) not in links:
-                links.append((sefaz, FONTES_OFICIAIS[sefaz]))
-    
-    return links[:5]  # Máximo 5 links
-
-def consultar_agente(pergunta):
-    """Consulta o agente de IA com contexto da biblioteca"""
+def consultar_agente(pergunta, historico_mensagens):
+    """Consulta o agente de IA"""
     if not client:
-        return "❌ API Key da OpenAI não configurada.", [], []
+        return "❌ API Key da OpenAI não configurada. Vá em Configurações para verificar.", [], []
     
-    # Buscar materiais relacionados
-    palavras = pergunta.split()
-    materiais = []
-    for palavra in palavras:
-        if len(palavra) > 3:
-            materiais.extend(buscar_na_biblioteca(palavra))
+    # Buscar na biblioteca
+    materiais = buscar_na_biblioteca(pergunta)
     
-    # Remover duplicados
-    materiais_unicos = []
-    ids_vistos = set()
-    for m in materiais:
-        if m['id'] not in ids_vistos:
-            materiais_unicos.append(m)
-            ids_vistos.add(m['id'])
+    # Identificar fontes relevantes
+    fontes = identificar_fontes_relevantes(pergunta)
     
-    # Obter contexto
-    contexto = obter_contexto_biblioteca()
+    # Contexto da biblioteca
+    contexto_biblioteca = obter_contexto_biblioteca()
     
-    # Gerar links de fontes oficiais
-    fontes = gerar_links_fontes(pergunta)
+    # Montar contexto dos materiais encontrados
+    contexto_materiais = ""
+    if materiais:
+        contexto_materiais = "\n\nMATERIAIS ENCONTRADOS NA BIBLIOTECA DO USUÁRIO:\n"
+        for m in materiais:
+            contexto_materiais += f"\n📄 **{m['titulo']}** (Cliente: {m['cliente_nome']})\n"
+            contexto_materiais += f"   Resumo: {m['resumo'][:300]}...\n"
     
-    # Prompt do sistema
-    system_prompt = f"""Você é um assistente especialista em tributação brasileira, integrado a uma biblioteca de estudos tributários.
+    system_prompt = f"""Você é um assistente especialista em tributação brasileira, similar ao ChatGPT, integrado a uma biblioteca de estudos tributários.
 
-SUA BASE DE CONHECIMENTO LOCAL:
-{contexto}
+BIBLIOTECA DO USUÁRIO (estudos cadastrados):
+{contexto_biblioteca}
+{contexto_materiais}
 
-FONTES OFICIAIS DISPONÍVEIS:
-- Receita Federal (www.gov.br/receitafederal)
-- Portal da Legislação - Planalto (www.planalto.gov.br)
-- SEFAZ de diversos estados (SC, ES, MG, SP, RJ, PE, CE)
+SUAS CAPACIDADES:
+1. Responder perguntas sobre tributação brasileira (ICMS, PIS, COFINS, IRPJ, CSLL, IPI, ISS, etc.)
+2. Explicar a Reforma Tributária (EC 132/2023, IBS, CBS, IS)
+3. Consultar e recomendar estudos da biblioteca do usuário
+4. Indicar fontes oficiais para consulta atualizada
+5. Explicar legislação, jurisprudência e procedimentos fiscais
 
-INSTRUÇÕES:
-1. Responda de forma clara, objetiva e tecnicamente precisa
-2. Se houver estudos relevantes na biblioteca, mencione-os
-3. Cite a legislação aplicável (Lei, Decreto, IN, etc.)
-4. Indique quando o usuário deve consultar as fontes oficiais para informações atualizadas
-5. Se não souber algo com certeza, indique que o usuário deve verificar nas fontes oficiais
-6. Use linguagem profissional mas acessível
-7. Formate a resposta com markdown para melhor leitura
+INSTRUÇÕES DE RESPOSTA:
+- Seja claro, objetivo e didático
+- Use linguagem profissional mas acessível
+- Estruture a resposta com tópicos quando apropriado
+- Se houver materiais relevantes na biblioteca, mencione-os naturalmente
+- Sempre indique que o usuário deve verificar a legislação vigente
+- Cite leis, decretos e normas quando relevante
+- Use markdown para formatar (negrito, listas, etc.)
 
-IMPORTANTE: Sempre alerte sobre a necessidade de verificar a legislação vigente, pois as normas tributárias mudam frequentemente."""
+IMPORTANTE: 
+- Você tem conhecimento até sua data de corte, mas a legislação tributária muda frequentemente
+- Sempre recomende consultar as fontes oficiais para informações atualizadas
+- Se não souber algo com certeza, seja honesto e indique onde buscar"""
 
     try:
+        # Preparar mensagens
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Adicionar histórico (últimas 10 mensagens)
+        for msg in historico_mensagens[-10:]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        
+        # Adicionar pergunta atual
+        messages.append({"role": "user", "content": pergunta})
+        
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": pergunta}
-            ],
-            max_tokens=2000,
-            temperature=0.3
+            messages=messages,
+            max_tokens=2500,
+            temperature=0.4
         )
+        
         resposta = response.choices[0].message.content
-        
-        # Salvar no histórico
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO chat_historico (pergunta, resposta, fontes) VALUES (?, ?, ?)",
-            (pergunta, resposta, json.dumps([f[0] for f in fontes]))
-        )
-        conn.commit()
-        conn.close()
-        
-        return resposta, materiais_unicos[:3], fontes
+        return resposta, materiais, fontes
     
     except Exception as e:
         return f"❌ Erro ao consultar: {str(e)}", [], []
 
-def obter_historico_chat(limite=10):
-    """Obtém histórico de conversas"""
+def salvar_mensagem(role, content, fontes=None):
+    """Salva mensagem no histórico"""
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT * FROM chat_historico ORDER BY created_at DESC LIMIT ?", (limite,))
-    historico = c.fetchall()
+    c.execute(
+        "INSERT INTO chat_historico (role, content, fontes) VALUES (?, ?, ?)",
+        (role, content, json.dumps(fontes) if fontes else None)
+    )
+    conn.commit()
+    conn.close()
+
+def obter_historico():
+    """Obtém histórico de mensagens"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT role, content, fontes, created_at FROM chat_historico ORDER BY created_at ASC")
+    historico = [{"role": r["role"], "content": r["content"], "fontes": r["fontes"], "created_at": r["created_at"]} for r in c.fetchall()]
     conn.close()
     return historico
 
 def limpar_historico():
-    """Limpa histórico de conversas"""
+    """Limpa histórico"""
     conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM chat_historico")
     conn.commit()
     conn.close()
 
-# ==================== FUNÇÕES CRUD ====================
+# ==================== FUNÇÕES CRUD (mantidas) ====================
 
 def criar_backup():
     backup_data = io.BytesIO()
@@ -276,10 +405,10 @@ def restaurar_backup(backup_file):
         for anx in backup.get("anexos", []):
             c.execute("INSERT INTO anexos (id, estudo_id, filename, file_type, file_data, file_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (anx['id'], anx['estudo_id'], anx['filename'], anx['file_type'], anx['file_data'], anx.get('file_size'), anx.get('created_at')))
         for chat in backup.get("chat_historico", []):
-            c.execute("INSERT INTO chat_historico (id, pergunta, resposta, fontes, created_at) VALUES (?, ?, ?, ?, ?)", (chat['id'], chat['pergunta'], chat['resposta'], chat.get('fontes'), chat.get('created_at')))
+            c.execute("INSERT INTO chat_historico (id, role, content, fontes, created_at) VALUES (?, ?, ?, ?, ?)", (chat['id'], chat['role'], chat['content'], chat.get('fontes'), chat.get('created_at')))
         conn.commit()
         conn.close()
-        return True, f"Restaurado: {len(backup.get('clientes', []))} clientes, {len(backup.get('estudos', []))} estudos, {len(backup.get('anexos', []))} anexos"
+        return True, f"Restaurado com sucesso!"
     except Exception as e:
         return False, f"Erro: {str(e)}"
 
@@ -416,7 +545,7 @@ def stats():
     te = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM anexos")
     ta = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM chat_historico")
+    c.execute("SELECT COUNT(*) FROM chat_historico WHERE role='user'")
     th = c.fetchone()[0]
     conn.close()
     return {"clientes": tc, "estudos": te, "anexos": ta, "consultas": th}
@@ -438,13 +567,13 @@ def fmt_size(s):
 
 # ==================== ESTADO ====================
 
-if "pag" not in st.session_state: st.session_state.pag = "home"
+if "pag" not in st.session_state: st.session_state.pag = "chat"
 if "cli" not in st.session_state: st.session_state.cli = None
 if "est" not in st.session_state: st.session_state.est = None
 if "edit" not in st.session_state: st.session_state.edit = False
-if "chat_resposta" not in st.session_state: st.session_state.chat_resposta = None
-if "chat_materiais" not in st.session_state: st.session_state.chat_materiais = []
-if "chat_fontes" not in st.session_state: st.session_state.chat_fontes = []
+if "ultima_resposta" not in st.session_state: st.session_state.ultima_resposta = None
+if "ultimos_materiais" not in st.session_state: st.session_state.ultimos_materiais = []
+if "ultimas_fontes" not in st.session_state: st.session_state.ultimas_fontes = []
 
 def go(p, c=None, e=None):
     st.session_state.pag = p
@@ -452,368 +581,341 @@ def go(p, c=None, e=None):
     st.session_state.est = e
     st.session_state.edit = False
 
-# ==================== SIDEBAR ====================
+# ==================== NAVEGAÇÃO SUPERIOR ====================
 
-with st.sidebar:
-    st.markdown("## 📚 Biblioteca Tributária")
-    st.markdown("---")
-    
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("🏠 Início", use_container_width=True): go("home")
-    with c2:
-        if st.button("➕ Novo", use_container_width=True): go("novo")
-    
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("🤖 Consultar", use_container_width=True): go("agente")
-    with c2:
-        if st.button("⚙️ Backup", use_container_width=True): go("config")
-    
-    st.markdown("---")
-    busca = st.text_input("🔍 Buscar", placeholder="Cliente, estudo ou tag...")
-    if busca:
-        st.markdown("### 📋 Resultados")
-        res = buscar_estudos(busca)
-        if res:
-            for r in res[:10]:
-                if st.button(f"📄 {r['titulo'][:30]}...", key=f"b_{r['id']}", use_container_width=True): go("estudo", r['cliente_id'], r['id'])
-        else: st.info("Nenhum resultado")
-    else:
-        st.markdown("### 👥 Clientes")
-        cls = listar_clientes()
-        if not cls: st.info("Nenhum cliente")
-        for cl in cls:
-            with st.expander(f"📁 {cl['nome']}", expanded=st.session_state.cli == cl['id']):
-                if st.button("👁️ Ver", key=f"v_{cl['id']}", use_container_width=True): go("cliente", cl['id'])
-                for es in listar_estudos(cl['id'])[:5]:
-                    t = es['titulo'][:25] + "..." if len(es['titulo']) > 25 else es['titulo']
-                    if st.button(f"�� {t}", key=f"e_{es['id']}", use_container_width=True): go("estudo", cl['id'], es['id'])
+col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 2])
+with col1:
+    if st.button("🤖 Consultor IA", use_container_width=True, type="primary" if st.session_state.pag == "chat" else "secondary"):
+        go("chat")
+with col2:
+    if st.button("📚 Biblioteca", use_container_width=True, type="primary" if st.session_state.pag == "biblioteca" else "secondary"):
+        go("biblioteca")
+with col3:
+    if st.button("➕ Novo Estudo", use_container_width=True, type="primary" if st.session_state.pag == "novo" else "secondary"):
+        go("novo")
+with col4:
+    if st.button("👥 Clientes", use_container_width=True, type="primary" if st.session_state.pag == "clientes" else "secondary"):
+        go("clientes")
+with col5:
+    if st.button("⚙️ Config", use_container_width=True, type="primary" if st.session_state.pag == "config" else "secondary"):
+        go("config")
+
+st.markdown("---")
 
 # ==================== PÁGINAS ====================
 
-if st.session_state.pag == "home":
-    st.markdown('<h1 class="main-header">📚 Biblioteca de Estudos Tributários</h1>', unsafe_allow_html=True)
-    s = stats()
-    c1, c2, c3, c4 = st.columns(4)
-    with c1: st.markdown(f'<div class="stat-card"><div class="stat-number">{s["clientes"]}</div><div class="stat-label">👥 Clientes</div></div>', unsafe_allow_html=True)
-    with c2: st.markdown(f'<div class="stat-card"><div class="stat-number">{s["estudos"]}</div><div class="stat-label">📄 Estudos</div></div>', unsafe_allow_html=True)
-    with c3: st.markdown(f'<div class="stat-card"><div class="stat-number">{s["anexos"]}</div><div class="stat-label">📎 Anexos</div></div>', unsafe_allow_html=True)
-    with c4: st.markdown(f'<div class="stat-card"><div class="stat-number">{s["consultas"]}</div><div class="stat-label">🤖 Consultas</div></div>', unsafe_allow_html=True)
+if st.session_state.pag == "chat":
+    st.markdown('<h1 class="main-header">🤖 Consultor Tributário IA</h1>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Pergunte sobre tributação, reforma tributária, ICMS, PIS/COFINS e muito mais.<br>Busco na sua biblioteca e em fontes oficiais.</p>', unsafe_allow_html=True)
+    
+    # Container do chat
+    chat_container = st.container()
+    
+    # Obter histórico
+    historico = obter_historico()
+    
+    # Exibir histórico de mensagens
+    with chat_container:
+        for msg in historico[-20:]:  # Últimas 20 mensagens
+            if msg["role"] == "user":
+                st.markdown(f'<div class="user-message">🧑 {msg["content"]}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="assistant-message">{msg["content"]}</div>', unsafe_allow_html=True)
+                
+                # Exibir fontes se houver
+                if msg.get("fontes"):
+                    try:
+                        fontes = json.loads(msg["fontes"])
+                        if fontes:
+                            st.markdown("**🔗 Fontes consultadas:**")
+                            for f in fontes:
+                                st.markdown(f'<div class="fonte-card"><a href="{f["url"]}" target="_blank">🏛️ {f["nome"]}</a> - {f["descricao"]}</div>', unsafe_allow_html=True)
+                    except:
+                        pass
     
     st.markdown("---")
     
-    # Acesso rápido ao Agente
-    st.markdown("### 🤖 Consulta Rápida")
-    pergunta_rapida = st.text_input("Faça uma pergunta tributária...", placeholder="Ex: Como funciona o ICMS-ST em SP?", key="pergunta_home")
-    if pergunta_rapida:
-        if st.button("🔍 Consultar", key="btn_consulta_rapida"):
-            go("agente")
-            st.session_state.pergunta_inicial = pergunta_rapida
-            st.rerun()
+    # Campo de input fixo no final
+    st.markdown("### 💬 Faça sua pergunta")
     
-    st.markdown("---")
-    st.markdown("### 📅 Estudos Recentes")
-    rec = estudos_recentes(5)
-    if rec:
-        for r in rec:
-            c1, c2 = st.columns([4, 1])
-            with c1:
-                st.markdown(f"**{r['titulo']}**")
-                st.caption(f"👤 {r['cliente_nome']} | 📅 {fmt_date(r['created_at'])}")
-                if r['tags']: st.markdown(" ".join([f'<span class="tag">{t.strip()}</span>' for t in r['tags'].split(",")]), unsafe_allow_html=True)
-            with c2:
-                if st.button("Abrir", key=f"a_{r['id']}"): go("estudo", r['cliente_id'], r['id'])
-            st.markdown("---")
-    else: st.info("Nenhum estudo. Clique em '➕ Novo' para começar!")
-
-elif st.session_state.pag == "agente":
-    st.markdown("## 🤖 Consultor Tributário IA")
-    st.markdown("Faça perguntas sobre tributação. O agente consulta sua biblioteca e fontes oficiais.")
-    
-    # Status da API
-    if client:
-        st.success("✅ OpenAI conectada")
-    else:
-        st.error("❌ API Key não configurada. Adicione em .streamlit/secrets.toml")
-    
-    st.markdown("---")
-    
-    # Formulário de pergunta
-    with st.form("form_pergunta", clear_on_submit=True):
+    with st.form("chat_form", clear_on_submit=True):
         pergunta = st.text_area(
-            "💬 Sua pergunta:", 
-            placeholder="Ex: Qual a alíquota de ICMS para venda interestadual de SP para MG?\nOu: Tenho algum estudo sobre substituição tributária?",
+            "Digite sua pergunta aqui:",
+            placeholder="Ex: Me explique sobre a reforma tributária e seus impactos no ICMS...\nOu: Tenho algum estudo sobre substituição tributária em SP?",
             height=100,
-            value=st.session_state.get("pergunta_inicial", "")
+            label_visibility="collapsed"
         )
         
-        col1, col2 = st.columns([3, 1])
+        col1, col2, col3 = st.columns([4, 1, 1])
         with col1:
-            submit = st.form_submit_button("🔍 Consultar", use_container_width=True, type="primary")
+            submit = st.form_submit_button("🔍 Enviar Pergunta", use_container_width=True, type="primary")
         with col2:
-            if st.form_submit_button("🗑️ Limpar", use_container_width=True):
-                st.session_state.chat_resposta = None
-                st.session_state.chat_materiais = []
-                st.session_state.chat_fontes = []
-                st.rerun()
+            nova_conversa = st.form_submit_button("🗑️ Nova", use_container_width=True)
     
-    # Limpar pergunta inicial após uso
-    if "pergunta_inicial" in st.session_state:
-        del st.session_state.pergunta_inicial
+    # Processar nova conversa
+    if nova_conversa:
+        limpar_historico()
+        st.rerun()
     
     # Processar pergunta
-    if submit and pergunta:
-        with st.spinner("🔄 Consultando base de conhecimento e fontes oficiais..."):
-            resposta, materiais, fontes = consultar_agente(pergunta)
-            st.session_state.chat_resposta = resposta
-            st.session_state.chat_materiais = materiais
-            st.session_state.chat_fontes = fontes
-    
-    # Exibir resposta
-    if st.session_state.chat_resposta:
-        st.markdown("### 💡 Resposta")
-        st.markdown(st.session_state.chat_resposta)
+    if submit and pergunta.strip():
+        # Salvar pergunta do usuário
+        salvar_mensagem("user", pergunta)
         
-        # Materiais da biblioteca
-        if st.session_state.chat_materiais:
-            st.markdown("---")
-            st.markdown("### 📚 Materiais Relacionados na Biblioteca")
-            for mat in st.session_state.chat_materiais:
-                st.markdown(f"""
-                <div class="material-sugerido">
-                    <strong>📄 {mat['titulo']}</strong><br>
-                    <small>Cliente: {mat['cliente_nome']} | Tags: {mat['tags'] or 'Sem tags'}</small><br>
-                    <small>{mat['resumo'][:150]}...</small>
-                </div>
-                """, unsafe_allow_html=True)
-                if st.button(f"Abrir estudo", key=f"abrir_mat_{mat['id']}"):
-                    # Buscar cliente_id
-                    conn = get_conn()
-                    c = conn.cursor()
-                    c.execute("SELECT cliente_id FROM estudos WHERE id = ?", (mat['id'],))
-                    cli_id = c.fetchone()[0]
-                    conn.close()
-                    go("estudo", cli_id, mat['id'])
+        with st.spinner("🔄 Pesquisando na biblioteca e fontes oficiais..."):
+            # Obter histórico atualizado para contexto
+            hist_mensagens = [{"role": m["role"], "content": m["content"]} for m in obter_historico()]
+            
+            # Consultar agente
+            resposta, materiais, fontes = consultar_agente(pergunta, hist_mensagens[:-1])  # Excluir a última (já está na pergunta)
+            
+            # Salvar resposta
+            salvar_mensagem("assistant", resposta, fontes)
+            
+            st.session_state.ultimos_materiais = materiais
+            st.session_state.ultimas_fontes = fontes
+        
+        st.rerun()
+    
+    # Mostrar materiais da biblioteca encontrados (última consulta)
+    if st.session_state.ultimos_materiais:
+        st.markdown("---")
+        st.markdown("### �� Materiais relacionados na sua biblioteca")
+        for m in st.session_state.ultimos_materiais:
+            st.markdown(f"""
+            <div class="biblioteca-card">
+                <strong>📄 {m['titulo']}</strong><br>
+                <small>Cliente: {m['cliente_nome']} | Tags: {m['tags'] or 'Sem tags'}</small><br>
+                <small>{m['resumo'][:150]}...</small>
+            </div>
+            """, unsafe_allow_html=True)
+
+elif st.session_state.pag == "biblioteca":
+    st.markdown("## �� Biblioteca de Estudos")
+    
+    # Busca
+    busca = st.text_input("🔍 Buscar estudos", placeholder="Digite para buscar...")
+    
+    if busca:
+        resultados = buscar_estudos(busca)
+        st.markdown(f"### Resultados para '{busca}' ({len(resultados)})")
+    else:
+        resultados = estudos_recentes(20)
+        st.markdown("### Estudos Recentes")
+    
+    if resultados:
+        for r in resultados:
+            with st.expander(f"📄 {r['titulo']} - {r['cliente_nome']}"):
+                st.markdown(f"**Cliente:** {r['cliente_nome']}")
+                st.markdown(f"**Data:** {fmt_date(r['created_at'])}")
+                if r['tags']:
+                    st.markdown("**Tags:** " + " ".join([f'`{t.strip()}`' for t in r['tags'].split(",")]))
+                st.markdown("**Resumo:**")
+                st.markdown(r['resumo'][:500] + "..." if len(r['resumo']) > 500 else r['resumo'])
+                
+                if st.button("Abrir completo", key=f"abrir_{r['id']}"):
+                    go("estudo", r['cliente_id'], r['id'])
                     st.rerun()
-        
-        # Fontes oficiais
-        if st.session_state.chat_fontes:
-            st.markdown("---")
-            st.markdown("### 🔗 Fontes Oficiais para Consulta")
-            for nome, url in st.session_state.chat_fontes:
-                st.markdown(f"""
-                <div class="fonte-oficial">
-                    <strong>🏛️ {nome}</strong><br>
-                    <a href="{url}" target="_blank">{url}</a>
-                </div>
-                """, unsafe_allow_html=True)
-    
-    # Histórico
-    st.markdown("---")
-    with st.expander("📜 Histórico de Consultas"):
-        historico = obter_historico_chat(10)
-        if historico:
-            for h in historico:
-                st.markdown(f"**🗣️ {h['pergunta'][:100]}...**")
-                st.caption(f"📅 {fmt_date(h['created_at'])}")
-                st.markdown("---")
-            if st.button("🗑️ Limpar Histórico"):
-                limpar_historico()
-                st.success("Histórico limpo!")
-                st.rerun()
-        else:
-            st.info("Nenhuma consulta realizada ainda.")
+    else:
+        st.info("Nenhum estudo encontrado.")
 
 elif st.session_state.pag == "novo":
     st.markdown("## ➕ Novo Cadastro")
-    t1, t2 = st.tabs(["👤 Novo Cliente", "📄 Novo Estudo"])
+    
+    t1, t2 = st.tabs(["📄 Novo Estudo", "👤 Novo Cliente"])
+    
     with t1:
-        with st.form("fc"):
+        cls = listar_clientes()
+        if not cls:
+            st.warning("⚠️ Cadastre um cliente primeiro na aba 'Novo Cliente'")
+        else:
+            with st.form("form_estudo"):
+                opts = {c['nome']: c['id'] for c in cls}
+                cliente = st.selectbox("Cliente *", list(opts.keys()))
+                titulo = st.text_input("Título do Estudo *")
+                resumo = st.text_area("Resumo / Conteúdo *", height=300, placeholder="Descreva o estudo tributário em detalhes...")
+                tags = st.text_input("Tags (separadas por vírgula)", placeholder="ICMS, ST, SP, Reforma")
+                arquivos = st.file_uploader("📎 Anexos", accept_multiple_files=True, type=["pdf", "xls", "xlsx", "doc", "docx", "txt", "csv", "png", "jpg"])
+                
+                if st.form_submit_button("💾 Salvar Estudo", use_container_width=True, type="primary"):
+                    if not titulo or not resumo:
+                        st.error("Título e Resumo são obrigatórios!")
+                    else:
+                        eid = criar_estudo(opts[cliente], titulo, resumo, tags)
+                        if arquivos:
+                            for a in arquivos:
+                                add_anexo(eid, a.name, a.type or "application/octet-stream", a.read(), a.size)
+                        st.success(f"✅ Estudo '{titulo}' criado!")
+                        st.balloons()
+    
+    with t2:
+        with st.form("form_cliente"):
             nome = st.text_input("Nome do Cliente *")
             cnpj = st.text_input("CNPJ")
             obs = st.text_area("Observações")
-            if st.form_submit_button("💾 Salvar"):
-                if not nome: st.error("Nome obrigatório!")
+            
+            if st.form_submit_button("💾 Salvar Cliente", use_container_width=True, type="primary"):
+                if not nome:
+                    st.error("Nome é obrigatório!")
                 else:
                     criar_cliente(nome, cnpj, obs)
                     st.success(f"✅ Cliente '{nome}' cadastrado!")
                     st.balloons()
-    with t2:
-        cls = listar_clientes()
-        if not cls: st.warning("⚠️ Cadastre um cliente primeiro!")
-        else:
-            with st.form("fe"):
-                opts = {c['nome']: c['id'] for c in cls}
-                cn = st.selectbox("Cliente *", list(opts.keys()))
-                tit = st.text_input("Título *")
-                res = st.text_area("Resumo da Operação *", height=250)
-                tags = st.text_input("Tags (separadas por vírgula)", placeholder="ICMS, ST, SP, MG")
-                arqs = st.file_uploader("📎 Anexos", accept_multiple_files=True, type=["pdf", "xls", "xlsx", "doc", "docx", "txt", "csv", "png", "jpg", "jpeg"])
-                if st.form_submit_button("💾 Salvar"):
-                    if not tit or not res: st.error("Título e Resumo obrigatórios!")
-                    else:
-                        eid = criar_estudo(opts[cn], tit, res, tags)
-                        if arqs:
-                            for a in arqs: add_anexo(eid, a.name, a.type or "application/octet-stream", a.read(), a.size)
-                        st.success(f"✅ Estudo '{tit}' criado!")
-                        st.balloons()
+
+elif st.session_state.pag == "clientes":
+    st.markdown("## 👥 Clientes")
+    
+    clientes = listar_clientes()
+    
+    if clientes:
+        for cl in clientes:
+            with st.expander(f"📁 {cl['nome']}" + (f" - CNPJ: {cl['cnpj']}" if cl['cnpj'] else "")):
+                estudos = listar_estudos(cl['id'])
+                st.markdown(f"**Estudos:** {len(estudos)}")
+                
+                if cl['observacoes']:
+                    st.markdown(f"**Obs:** {cl['observacoes']}")
+                
+                if estudos:
+                    st.markdown("**Estudos:**")
+                    for e in estudos[:5]:
+                        if st.button(f"📄 {e['titulo']}", key=f"est_{cl['id']}_{e['id']}"):
+                            go("estudo", cl['id'], e['id'])
+                            st.rerun()
+                
+                if st.button("🗑️ Excluir Cliente", key=f"del_cli_{cl['id']}"):
+                    excluir_cliente(cl['id'])
+                    st.rerun()
+    else:
+        st.info("Nenhum cliente cadastrado. Vá em 'Novo Estudo' para cadastrar.")
 
 elif st.session_state.pag == "config":
     st.markdown("## ⚙️ Configurações")
     
-    tab1, tab2 = st.tabs(["💾 Backup", "🔑 API"])
-    
-    with tab1:
-        st.markdown('<div class="backup-box">⚠️ <strong>Importante:</strong> Faça backup regularmente!</div>', unsafe_allow_html=True)
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("#### 📥 Criar Backup")
-            if st.button("🔄 Gerar Backup", use_container_width=True):
-                backup_zip = criar_backup()
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                st.download_button("⬇️ Baixar Backup", backup_zip, f"backup_biblioteca_{ts}.zip", "application/zip", use_container_width=True)
-                st.success("✅ Backup gerado!")
-        with col2:
-            st.markdown("#### 📤 Restaurar Backup")
-            up = st.file_uploader("Arquivo .zip ou .json", type=["zip", "json"])
-            if up:
-                if st.button("🔄 Restaurar", use_container_width=True, type="primary"):
-                    ok, msg = restaurar_backup(up)
-                    if ok:
-                        st.success(f"✅ {msg}")
-                        st.balloons()
-                    else:
-                        st.error(f"❌ {msg}")
-    
-    with tab2:
-        st.markdown("#### 🔑 Status da API OpenAI")
-        if client:
-            st.success("✅ API Key configurada e funcionando")
-        else:
-            st.error("❌ API Key não configurada")
-            st.markdown("""
-            Para configurar:
-            1. Crie o arquivo `.streamlit/secrets.toml`
-            2. Adicione: `OPENAI_API_KEY = "sua-chave-aqui"`
-            """)
+    # Status
+    col1, col2, col3, col4 = st.columns(4)
+    s = stats()
+    with col1: st.metric("Clientes", s["clientes"])
+    with col2: st.metric("Estudos", s["estudos"])
+    with col3: st.metric("Anexos", s["anexos"])
+    with col4: st.metric("Consultas IA", s["consultas"])
     
     st.markdown("---")
-    st.markdown("### 📊 Estatísticas")
-    s = stats()
-    c1, c2, c3, c4 = st.columns(4)
-    with c1: st.metric("Clientes", s["clientes"])
-    with c2: st.metric("Estudos", s["estudos"])
-    with c3: st.metric("Anexos", s["anexos"])
-    with c4: st.metric("Consultas IA", s["consultas"])
-
-elif st.session_state.pag == "cliente":
-    cl = obter_cliente(st.session_state.cli)
-    if cl:
-        c1, c2 = st.columns([4, 1])
-        with c1:
-            st.markdown(f"## 📁 {cl['nome']}")
-            if cl['cnpj']: st.caption(f"CNPJ: {cl['cnpj']}")
-        with c2:
-            if st.button("🗑️ Excluir"):
-                excluir_cliente(cl['id'])
-                go("home")
-                st.rerun()
-        if cl['observacoes']: st.info(cl['observacoes'])
-        st.markdown("---")
-        ests = listar_estudos(cl['id'])
-        if ests:
-            st.markdown(f"### 📚 Estudos ({len(ests)})")
-            for e in ests:
-                c1, c2 = st.columns([4, 1])
-                with c1:
-                    st.markdown(f"#### {e['titulo']}")
-                    st.caption(f"📅 {fmt_date(e['created_at'])}")
-                    if e['tags']: st.markdown(" ".join([f'<span class="tag">{t.strip()}</span>' for t in e['tags'].split(",")]), unsafe_allow_html=True)
-                with c2:
-                    if st.button("📖 Abrir", key=f"ae_{e['id']}"): go("estudo", cl['id'], e['id'])
-                st.markdown("---")
-        else: st.info("Nenhum estudo.")
+    
+    # API Status
+    st.markdown("### 🔑 API OpenAI")
+    if client:
+        st.success("✅ Conectada e funcionando")
+    else:
+        st.error("❌ Não configurada - adicione a chave em .streamlit/secrets.toml")
+    
+    st.markdown("---")
+    
+    # Backup
+    st.markdown("### 💾 Backup")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("📥 Gerar Backup", use_container_width=True):
+            backup = criar_backup()
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button("⬇️ Baixar Backup", backup, f"backup_{ts}.zip", "application/zip", use_container_width=True)
+    
+    with col2:
+        uploaded = st.file_uploader("Restaurar backup", type=["zip", "json"])
+        if uploaded:
+            if st.button("📤 Restaurar", use_container_width=True, type="primary"):
+                ok, msg = restaurar_backup(uploaded)
+                if ok:
+                    st.success(f"✅ {msg}")
+                else:
+                    st.error(f"❌ {msg}")
 
 elif st.session_state.pag == "estudo":
     est = obter_estudo(st.session_state.est)
     cl = obter_cliente(st.session_state.cli)
+    
     if est and cl:
-        c1, c2, c3 = st.columns([3, 1, 1])
-        with c1:
+        # Cabeçalho
+        col1, col2, col3 = st.columns([4, 1, 1])
+        with col1:
             st.markdown(f"## 📖 {est['titulo']}")
             st.caption(f"👤 {cl['nome']} | 📅 {fmt_date(est['created_at'])}")
-        with c2:
+        with col2:
             if st.button("✏️ Editar"):
                 st.session_state.edit = True
                 st.rerun()
-        with c3:
+        with col3:
             if st.button("🗑️ Excluir"):
                 excluir_estudo(est['id'])
-                go("cliente", cl['id'])
+                go("biblioteca")
                 st.rerun()
-        if est['tags']: st.markdown(" ".join([f'<span class="tag">{t.strip()}</span>' for t in est['tags'].split(",")]), unsafe_allow_html=True)
+        
+        # Tags
+        if est['tags']:
+            st.markdown(" ".join([f'<span class="tag">{t.strip()}</span>' for t in est['tags'].split(",")]), unsafe_allow_html=True)
+        
         st.markdown("---")
+        
+        # Modo edição
         if st.session_state.edit:
-            with st.form("fed"):
-                nt = st.text_input("Título", value=est['titulo'])
-                nr = st.text_area("Resumo", value=est['resumo'], height=300)
-                ntg = st.text_input("Tags", value=est['tags'] or "")
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.form_submit_button("💾 Salvar"):
-                        atualizar_estudo(est['id'], nt, nr, ntg)
+            with st.form("form_editar"):
+                novo_titulo = st.text_input("Título", value=est['titulo'])
+                novo_resumo = st.text_area("Resumo", value=est['resumo'], height=400)
+                novas_tags = st.text_input("Tags", value=est['tags'] or "")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.form_submit_button("💾 Salvar", use_container_width=True, type="primary"):
+                        atualizar_estudo(est['id'], novo_titulo, novo_resumo, novas_tags)
                         st.session_state.edit = False
                         st.rerun()
-                with c2:
-                    if st.form_submit_button("❌ Cancelar"):
+                with col2:
+                    if st.form_submit_button("❌ Cancelar", use_container_width=True):
                         st.session_state.edit = False
                         st.rerun()
         else:
-            st.markdown("### 📋 Resumo")
+            st.markdown("### 📋 Conteúdo")
             st.markdown(est['resumo'])
         
+        # Anexos
         st.markdown("---")
         st.markdown("### 📎 Anexos")
-        anxs = listar_anexos(est['id'])
-        if anxs:
-            for a in anxs:
-                c1, c2, c3, c4 = st.columns([0.5, 3, 1, 0.5])
-                with c1: st.markdown(file_icon(a['file_type']))
-                with c2: st.markdown(f"**{a['filename']}** ({fmt_size(a['file_size'])})")
-                with c3:
-                    ac = obter_anexo(a['id'])
-                    if ac: st.download_button("⬇️", base64.b64decode(ac['file_data']), a['filename'], a['file_type'], key=f"d_{a['id']}")
-                with c4:
-                    if st.button("🗑️", key=f"x_{a['id']}"):
+        
+        anexos = listar_anexos(est['id'])
+        if anexos:
+            for a in anexos:
+                col1, col2, col3 = st.columns([4, 1, 1])
+                with col1:
+                    st.markdown(f"{file_icon(a['file_type'])} **{a['filename']}** ({fmt_size(a['file_size'])})")
+                with col2:
+                    anx_data = obter_anexo(a['id'])
+                    if anx_data:
+                        st.download_button("⬇️", base64.b64decode(anx_data['file_data']), a['filename'], a['file_type'], key=f"dl_{a['id']}")
+                with col3:
+                    if st.button("🗑️", key=f"del_{a['id']}"):
                         excluir_anexo(a['id'])
                         st.rerun()
-        else: 
+        else:
             st.info("Nenhum anexo")
         
+        # Upload de novos anexos
+        with st.form("form_anexos", clear_on_submit=True):
+            novos = st.file_uploader("Adicionar anexos", accept_multiple_files=True, type=["pdf", "xls", "xlsx", "doc", "docx", "txt", "png", "jpg"])
+            if st.form_submit_button("📤 Enviar", use_container_width=True):
+                if novos:
+                    for a in novos:
+                        content = a.read()
+                        add_anexo(est['id'], a.name, a.type or "application/octet-stream", content, len(content))
+                    st.success(f"✅ {len(novos)} arquivo(s) adicionado(s)!")
+                    st.rerun()
+        
+        # Botão voltar
         st.markdown("---")
-        st.markdown("#### ➕ Adicionar Novos Anexos")
-        with st.form("form_novos_anexos", clear_on_submit=True):
-            novos_arquivos = st.file_uploader(
-                "Selecione os arquivos", 
-                accept_multiple_files=True, 
-                type=["pdf", "xls", "xlsx", "doc", "docx", "txt", "png", "jpg", "jpeg"],
-                key="upload_novos"
-            )
-            submit_upload = st.form_submit_button("📤 Enviar Arquivos", use_container_width=True)
-            
-            if submit_upload and novos_arquivos:
-                for arq in novos_arquivos:
-                    file_content = arq.read()
-                    add_anexo(
-                        est['id'], 
-                        arq.name, 
-                        arq.type or "application/octet-stream", 
-                        file_content, 
-                        len(file_content)
-                    )
-                st.success(f"✅ {len(novos_arquivos)} arquivo(s) adicionado(s)!")
-                st.rerun()
+        if st.button("← Voltar para Biblioteca"):
+            go("biblioteca")
+            st.rerun()
 
+# Footer
 st.markdown("---")
-st.caption("📚 Biblioteca de Estudos Tributários | 🤖 Agente IA Integrado")
+st.caption("📚 Biblioteca Tributária | 🤖 Consultor IA Integrado")
