@@ -431,6 +431,7 @@ elif st.session_state.pag == "estudo":
         else:
             st.markdown("### 📋 Resumo")
             st.markdown(est['resumo'])
+        
         st.markdown("---")
         st.markdown("### 📎 Anexos")
         anxs = listar_anexos(est['id'])
@@ -446,12 +447,32 @@ elif st.session_state.pag == "estudo":
                     if st.button("🗑️", key=f"x_{a['id']}"):
                         excluir_anexo(a['id'])
                         st.rerun()
-        else: st.info("Nenhum anexo")
-        st.markdown("#### Adicionar Anexos")
-        novos = st.file_uploader("Selecione", accept_multiple_files=True, type=["pdf", "xls", "xlsx", "doc", "docx", "txt", "png", "jpg"], key="na")
-        if novos and st.button("📤 Upload"):
-            for a in novos: add_anexo(est['id'], a.name, a.type or "application/octet-stream", a.read(), a.size)
-            st.rerun()
+        else: 
+            st.info("Nenhum anexo")
+        
+        st.markdown("---")
+        st.markdown("#### ➕ Adicionar Novos Anexos")
+        with st.form("form_novos_anexos", clear_on_submit=True):
+            novos_arquivos = st.file_uploader(
+                "Selecione os arquivos", 
+                accept_multiple_files=True, 
+                type=["pdf", "xls", "xlsx", "doc", "docx", "txt", "png", "jpg", "jpeg"],
+                key="upload_novos"
+            )
+            submit_upload = st.form_submit_button("📤 Enviar Arquivos", use_container_width=True)
+            
+            if submit_upload and novos_arquivos:
+                for arq in novos_arquivos:
+                    file_content = arq.read()
+                    add_anexo(
+                        est['id'], 
+                        arq.name, 
+                        arq.type or "application/octet-stream", 
+                        file_content, 
+                        len(file_content)
+                    )
+                st.success(f"✅ {len(novos_arquivos)} arquivo(s) adicionado(s)!")
+                st.rerun()
 
 st.markdown("---")
 st.caption("📚 Biblioteca de Estudos Tributários | Sistema com Backup")
